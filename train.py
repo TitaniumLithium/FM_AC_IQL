@@ -1,0 +1,32 @@
+from scripts.train_fmiql_minari import train_agent
+import argparse
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset_id", type=str, default="mujoco/hopper/medium-v0")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--num_steps", type=int, default=10_000_000)
+    parser.add_argument("--batch_size", type=int, default=2048)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--tau", type=float, default=0.005)
+    parser.add_argument("--expectile", type=float, default=0.8)
+    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--actor_lr", type=float, default=3e-4)
+    parser.add_argument("--critic_lr", type=float, default=3e-4)
+    parser.add_argument("--value_lr", type=float, default=3e-4)
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0)
+    parser.add_argument("--eval_interval", type=int, default=500_000)
+    parser.add_argument("--eval_episodes", type=int, default=3)
+    parser.add_argument("--log_interval", type=int, default=100_000)
+    parser.add_argument("--use_wandb", type=int, default=0)
+    parser.add_argument("--wandb_project", type=str, default="fmiql-minari-hopper")
+    parser.add_argument("--wandb_name", type=str, default="")
+    parser.add_argument("--save_path", type=str, default="./checkpoints/")
+    parser.add_argument("--chunk_len", type=int, default=4)
+    parser.add_argument("--save_videos", type=int, default=0)
+    parser.add_argument("--env_id", type=str, default="Hopper-v5")
+    args = parser.parse_args()
+    train_agent(args)
+
+if __name__ == "__main__":
+    main()
