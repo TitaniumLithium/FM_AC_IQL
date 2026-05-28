@@ -3,6 +3,17 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+#ckpt dataset results
+runs/
+checkpoints/
+logs/
+videos/
+dataset/
+wandb/
+*.pth
+*.pt
+*.mp4
+
 # C extensions
 *.so
 
