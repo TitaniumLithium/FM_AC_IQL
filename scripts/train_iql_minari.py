@@ -7,13 +7,45 @@ import wandb
 import minari
 import os
 import gymnasium as gym
+from typing import Dict, Iterable, List, Tuple
 
-from agents.FMIQLagent import IQLAgent
-from utils.eval import evaluate_policy,evaluate_policy_video
-from utils.tools import set_seed,soft_update
-from utils.minari_chunkreplaybuffer import load_minari_dataset
+from agents.GaussianIQLagent import IQLAgent
+from utils.tools import set_seed,soft_update,to_tensor
+from utils.minari_replaybuffer import load_minari_dataset,ReplayBuffer
+
+
+@torch.no_grad()
+def evaluate_policy(
+    agent: IQLAgent,
+    env,
+    replay: ReplayBuffer,
+    episodes: int,
+    seed: int,
+) -> Dict[str, float]:
+    returns: List[float] = []
+    lengths: List[int] = []
+    for ep in range(episodes):
+        obs, _ = env.reset(seed=seed + ep)
+        done = False
+        ep_ret = 0.0
+        ep_len = 0
+        while not done:
+            action = agent.act(obs, replay=replay, deterministic=True)
+            action = np.clip(action, env.action_space.low, env.action_space.high)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            done = bool(terminated or truncated)
+            ep_ret += float(reward)
+            ep_len += 1
+        returns.append(ep_ret)
+        lengths.append(ep_len)
+    return {
+        "eval_return_mean": float(np.mean(returns)),
+        "eval_return_std": float(np.std(returns)),
+        "eval_length_mean": float(np.mean(lengths)),
+    }
 
 def train_agent(args):
+    set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     print(f"Loading dataset: {args.dataset_id}")
@@ -26,9 +58,9 @@ def train_agent(args):
         f"Dataset loaded: size={replay.size:,}, obs_dim={bundle.obs_dim}, act_dim={bundle.act_dim}, "
         f"obs_mean_shape={tuple(replay.obs_mean.shape)}"
     )
-
-    last_path = args.save_path + "last.pt"
-    best_path = args.save_path + "best.pt"
+    
+    last_path = args.save_path + "iql_last.pt"
+    best_path = args.save_path + "iql_best.pt"
 
     agent = IQLAgent(
         obs_dim=bundle.obs_dim,
@@ -42,14 +74,11 @@ def train_agent(args):
         critic_lr=args.critic_lr,
         value_lr=args.value_lr,
         grad_clip_norm=args.grad_clip_norm,
-        obs_horizon=1,
-        act_horizon=args.chunk_len,
-        chunk_len=args.chunk_len
     )
-
-    use_wandb = bool(args.use_wandb and wandb is not None)
+    
     save_videos = bool(args.save_videos and args.env_id is not None)
-
+    
+    use_wandb = bool(args.use_wandb and wandb is not None)
     if args.use_wandb and wandb is None:
         print("wandb is not installed; continuing without wandb logging.")
     if use_wandb:
@@ -59,27 +88,27 @@ def train_agent(args):
             config=vars(args),
         )
         wandb.watch(agent.actor, log="gradients", log_freq=max(1, args.log_interval))
-
+        
     num_epochs = args.num_steps//args.batch_size + 1
     if args.batch_size > args.log_interval:
         args.log_interval = args.batch_size
     if args.batch_size > args.eval_interval:
         args.eval_interval = args.batch_size
-    step = 0
+    global_steps = 0
     next_log_step = args.log_interval
     next_eval_step = args.eval_interval
-
+    
     print(f"num_epochs = {args.num_steps}//{args.batch_size} + 1 = {num_epochs}")
-
+    
     best_eval = -float("inf")
     pbar = tqdm(range(1, num_epochs + 1), desc="training", dynamic_ncols=True)
-
+    
     for epoch in pbar:
         batch = replay.sample(args.batch_size)
         metrics = agent.update(batch, replay)
-        step += args.batch_size
+        global_steps += args.batch_size
 
-        if step >= next_log_step:
+        if global_steps >= next_log_step:
             next_log_step += args.log_interval
             pbar.set_postfix(
                 {
@@ -90,7 +119,7 @@ def train_agent(args):
                 }
             )
             print(
-                f"step={step:>7d} "
+                f"step={global_steps:>7d} "
                 f"loss_total={metrics['loss_total']:.4f} "
                 f"value_loss={metrics['value_loss']:.4f} "
                 f"critic_loss={metrics['critic_loss']:.4f} "
@@ -100,67 +129,34 @@ def train_agent(args):
                 f"q1_mean={metrics['q1_mean']:.4f} q2_mean={metrics['q2_mean']:.4f} "
                 f"v_mean={metrics['v_mean']:.4f}"
             )
-
             if use_wandb:
-                wandb.log({**metrics, "step": step, "epoch": epoch}, step=epoch)
+                wandb.log({**metrics, "global_steps": global_steps, "epoch": epoch}, step=epoch)
 
-
-        if step >= next_eval_step:
+        if global_steps >= next_eval_step:
             next_eval_step += args.eval_interval
             eval_metrics = evaluate_policy(agent, env, replay, episodes=args.eval_episodes, seed=args.seed + 1000)
             print(
-                f"[EVAL] step={step:>7d} "
+                f"[EVAL] step={global_steps:>7d} "
                 f"return_mean={eval_metrics['eval_return_mean']:.2f} ± {eval_metrics['eval_return_std']:.2f} "
                 f"len_mean={eval_metrics['eval_length_mean']:.1f}"
             )
-            last_path = args.save_path + f"last_{step}.pt"
-
-            ckpt = {
-                "actor": agent.actor.state_dict(),
-                "critic": agent.critic.state_dict(),
-                "critic_target": agent.critic_target.state_dict(),
-                "value": agent.value.state_dict(),
-                "obs_mean": replay.obs_mean,
-                "obs_std": replay.obs_std,
-                "args": vars(args),
-                "best_eval_return_mean": best_eval,
-            }
-
-            torch.save(ckpt, last_path)
-
             if use_wandb:
-                wandb.log({**eval_metrics, "step": step, "epoch": epoch}, step=epoch)
-                artifact_last = wandb.Artifact(
-                    name=f"last_agent_{step}",
-                    type="model"
-                )
-                artifact_last.add_file(last_path)
-                wandb.log_artifact(artifact_last)
-            
+                wandb.log({**eval_metrics, "global_steps": global_steps, "epoch": epoch}, step=epoch)
 
             if eval_metrics["eval_return_mean"] > best_eval:
                 best_eval = eval_metrics["eval_return_mean"]
+                ckpt = {
+                    "actor": agent.actor.state_dict(),
+                    "critic": agent.critic.state_dict(),
+                    "critic_target": agent.critic_target.state_dict(),
+                    "value": agent.value.state_dict(),
+                    "obs_mean": replay.obs_mean,
+                    "obs_std": replay.obs_std,
+                    "args": vars(args),
+                    "best_eval_return_mean": best_eval,
+                }
                 torch.save(ckpt, best_path)
                 print(f"Saved best checkpoint to {best_path}")
-                if save_videos:
-                    video_path = "./videos/" + f"rollout_{step}.mp4"
-                    video_eval = gym.make(args.env_id,render_mode="rgb_array")
-                    evaluate_policy_video(agent, video_eval, replay, args.seed + 1000, video_path)
-                if use_wandb:
-                    artifact_best = wandb.Artifact(
-                        name="best_agent",
-                        type="model"
-                    )
-                    artifact_best.add_file(best_path)
-                    wandb.log_artifact(artifact_best)
-                    if save_videos:
-                        wandb.log({
-                            "video": wandb.Video(
-                                video_path,
-                                fps=30,
-                                format="mp4"
-                            )
-                        })
 
     if use_wandb:
         wandb.finish()

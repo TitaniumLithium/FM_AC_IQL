@@ -7,13 +7,15 @@ from typing import Dict, Iterable, List, Tuple
 
 @dataclass
 class ReplayBuffer:
-    obs: torch.Tensor
-    actions: torch.Tensor
-    next_obs: torch.Tensor
-    rewards: torch.Tensor
-    dones: torch.Tensor
+    # obs[t] is the starting state of the chunk
+    obs: torch.Tensor          # [N, obs_dim]
+    actions: torch.Tensor      # [N, chunk_len, act_dim]
+    next_obs: torch.Tensor     # [N, obs_dim]
+    rewards: torch.Tensor      # [N, 1]  discounted chunk return
+    dones: torch.Tensor        # [N, 1]  done at end of chunk
     obs_mean: torch.Tensor
     obs_std: torch.Tensor
+    chunk_len: int
 
     @property
     def size(self) -> int:
@@ -43,7 +45,20 @@ class DatasetBundle:
     act_high: np.ndarray
 
 
-def load_minari_dataset(dataset_id: str, device: torch.device) -> DatasetBundle:
+def load_minari_dataset(
+    dataset_id: str,
+    device: torch.device,
+    chunk_len: int = 4,
+    gamma: float = 0.99,
+) -> DatasetBundle:
+    """
+    Build action-chunk transitions:
+      (obs_t, a_t:t+H-1, next_obs_{t+H}, discounted_chunk_return, done_{t+H-1})
+
+    For an episode with T actions / T+1 observations:
+      valid starts are t in [0, T-H]
+      i.e. H=4 and T=1000 -> t in [0, 996]
+    """
     dataset = minari.load_dataset(dataset_id)
     # Minari docs state this dataset can be recovered from the same env spec;
     # eval_env=True is the intended online evaluation env when available.
@@ -58,26 +73,58 @@ def load_minari_dataset(dataset_id: str, device: torch.device) -> DatasetBundle:
     rew_list: List[np.ndarray] = []
     done_list: List[np.ndarray] = []
 
+    gamma_powers = (gamma ** np.arange(chunk_len, dtype=np.float32)).astype(np.float32)
+
     for ep in dataset.iterate_episodes():
-        obs = np.asarray(ep.observations, dtype=np.float32)
-        actions = np.asarray(ep.actions, dtype=np.float32)
-        rewards = np.asarray(ep.rewards, dtype=np.float32)
+        obs = np.asarray(ep.observations, dtype=np.float32) # [T+1, obs_dim]
+        actions = np.asarray(ep.actions, dtype=np.float32) # [T, act_dim]
+        rewards = np.asarray(ep.rewards, dtype=np.float32) # [T]
         terminations = np.asarray(ep.terminations, dtype=np.bool_)
         truncations = np.asarray(ep.truncations, dtype=np.bool_)
         dones = np.logical_or(terminations, truncations)
 
-        # observations include the initial state, so obs[t] -> obs[t+1]
-        obs_list.append(obs[:-1])
-        next_obs_list.append(obs[1:])
-        act_list.append(actions)
-        rew_list.append(rewards[:, None])
-        done_list.append(dones[:, None].astype(np.float32))
+        T = actions.shape[0]
+        if T < chunk_len:
+            continue
 
-    obs_arr = np.concatenate(obs_list, axis=0)
-    act_arr = np.concatenate(act_list, axis=0)
-    next_obs_arr = np.concatenate(next_obs_list, axis=0)
-    rew_arr = np.concatenate(rew_list, axis=0)
-    done_arr = np.concatenate(done_list, axis=0)
+        # Sliding window inside the episode.
+        # start t: 0 .. T-chunk_len
+
+        for t in range(T - chunk_len + 1):
+            end = t + chunk_len
+
+            # Optional safety check:
+            # do not let the chunk cross an earlier terminal/truncation.
+            # In standard episode data this usually will not happen except at the end.
+            if np.any(dones[t:end - 1]):
+                continue
+
+            chunk_reward = float(np.sum(rewards[t:end] * gamma_powers))
+            chunk_done = float(dones[end - 1])
+
+            obs_list.append(obs[t])                     # starting state
+            act_list.append(actions[t:end])             # [chunk_len, act_dim]
+            next_obs_list.append(obs[end])              # state after chunk
+            rew_list.append(np.array([chunk_reward], dtype=np.float32))
+            done_list.append(np.array([chunk_done], dtype=np.float32))
+
+
+    if len(obs_list) == 0:
+        raise ValueError(
+            f"No valid chunk samples found. dataset_id={dataset_id}, chunk_len={chunk_len}"
+        )
+
+    obs_arr = np.stack(obs_list, axis=0)                    # [N, obs_dim]
+    act_arr = np.stack(act_list, axis=0)                   # [N, chunk_len, act_dim]
+    next_obs_arr = np.stack(next_obs_list, axis=0)         # [N, obs_dim]
+    rew_arr = np.concatenate(rew_list, axis=0)[:, None]    # [N, 1]
+    done_arr = np.concatenate(done_list, axis=0)[:, None]  # [N, 1]
+    
+    n = obs_arr.shape[0]
+    assert act_arr.shape[0] == n
+    assert next_obs_arr.shape[0] == n
+    assert rew_arr.shape[0] == n
+    assert done_arr.shape[0] == n
 
     obs_mean = torch.as_tensor(obs_arr.mean(axis=0), device=device, dtype=torch.float32)
     obs_std = torch.as_tensor(obs_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
@@ -90,6 +137,7 @@ def load_minari_dataset(dataset_id: str, device: torch.device) -> DatasetBundle:
         dones=torch.as_tensor(done_arr, device=device, dtype=torch.float32),
         obs_mean=obs_mean,
         obs_std=obs_std,
+        chunk_len=chunk_len,
     )
 
     obs_space = dataset.observation_space
