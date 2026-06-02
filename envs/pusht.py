@@ -242,6 +242,7 @@ class PushTEnv(gym.Env):
         self.control_hz = self.metadata["render_fps"]
         # legcay set_state for data compatiblity
         self.legacy = legacy
+        self.dt = self.control_hz
 
         # agent_pos, block_pos, block_angle
         self.observation_space = spaces.Box(
