@@ -21,6 +21,7 @@ def evaluate_policy(
     replay: ReplayBuffer,
     episodes: int,
     seed: int,
+    max_steps:int = 1000
 ) -> Dict[str, float]:
     returns: List[float] = []
     lengths: List[int] = []
@@ -36,6 +37,8 @@ def evaluate_policy(
             done = bool(terminated or truncated)
             ep_ret += float(reward)
             ep_len += 1
+            if ep_len>max_steps:
+                break
         returns.append(ep_ret)
         lengths.append(ep_len)
     return {
