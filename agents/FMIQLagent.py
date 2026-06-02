@@ -162,19 +162,15 @@ class IQLAgent:
         
         self.ema = EMA(self.actor.net, decay=ema_decay) if use_ema else None
 
-    def normalize_obs(self, obs: torch.Tensor, replay: ReplayBuffer) -> torch.Tensor:
-        return replay.normalize_obs(obs)
-
-    def value_loss(self, obs: torch.Tensor, actions: torch.Tensor, replay: ReplayBuffer) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def value_loss(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
         '''
         obs [B, obs_dim]
         actions [B, H, act_dim]
         '''
-        obs_n = self.normalize_obs(obs, replay)
         with torch.no_grad():
-            q1_t, q2_t = self.critic_target(obs_n, actions)
+            q1_t, q2_t = self.critic_target(obs, actions)
             q = torch.min(q1_t, q2_t)
-        v = self.value(obs_n)
+        v = self.value(obs)
         diff = q - v
         weight = torch.where(diff > 0, self.expectile, 1.0 - self.expectile)
         loss = (weight * diff.square()).mean()
@@ -193,15 +189,12 @@ class IQLAgent:
         next_obs: torch.Tensor,
         rewards: torch.Tensor,
         dones: torch.Tensor,
-        replay: ReplayBuffer,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        obs_n = self.normalize_obs(obs, replay)
-        next_obs_n = self.normalize_obs(next_obs, replay)
         chunk_gamma = self.gamma ** self.chunk_len
         with torch.no_grad():
-            target_v = self.value(next_obs_n)
+            target_v = self.value(next_obs)
             target_q = rewards + chunk_gamma * (1.0 - dones) * target_v
-        q1, q2 = self.critic(obs_n, actions)
+        q1, q2 = self.critic(obs, actions)
         loss1 = F.mse_loss(q1, target_q)
         loss2 = F.mse_loss(q2, target_q)
         loss = loss1 + loss2
@@ -213,19 +206,18 @@ class IQLAgent:
         }
         return loss, info
 
-    def actor_loss(self, obs: torch.Tensor, actions: torch.Tensor, replay: ReplayBuffer) -> Tuple[torch.Tensor, Dict[str, float]]:
-        obs_n = self.normalize_obs(obs, replay)
+    def actor_loss(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
         with torch.no_grad():
-            q1, q2 = self.critic_target(obs_n, actions)
+            q1, q2 = self.critic_target(obs, actions)
             q = torch.min(q1, q2)
-            v = self.value(obs_n)
+            v = self.value(obs)
             adv = q - v
             # IQL paper uses advantage-weighted regression. In the official JAX code,
             # temperature is a multiplier on advantage, so larger values sharpen the weights.
             weights = torch.exp(torch.clamp(adv * self.temperature, max=100.0))
             weights = torch.clamp(weights, max=100.0) #[B,1]
 
-        fm_loss, _ = self.actor.flow_match_loss(obs_n,actions) # [B]
+        fm_loss, _ = self.actor.flow_match_loss(obs,actions) # [B]
         fm_loss = fm_loss.reshape(-1,1)
 
         loss = (weights * fm_loss).mean()
@@ -236,12 +228,12 @@ class IQLAgent:
         }
         return loss, info
 
-    def update(self, batch: Dict[str, torch.Tensor], replay: ReplayBuffer) -> Dict[str, float]:
+    def update(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         metrics: Dict[str, float] = {}
 
         # 1) value update
         self.value_opt.zero_grad(set_to_none=True)
-        v_loss, v_info = self.value_loss(batch["obs"], batch["actions"], replay)
+        v_loss, v_info = self.value_loss(batch["obs"], batch["actions"])
         v_loss.backward()
         nn.utils.clip_grad_norm_(self.value.parameters(), self.grad_clip_norm)
         self.value_opt.step()
@@ -249,7 +241,7 @@ class IQLAgent:
 
         # 2) actor update (uses updated value network)
         self.actor_opt.zero_grad(set_to_none=True)
-        a_loss, a_info = self.actor_loss(batch["obs"], batch["actions"], replay)
+        a_loss, a_info = self.actor_loss(batch["obs"], batch["actions"])
         a_loss.backward()
         nn.utils.clip_grad_norm_(self.actor.net.parameters(), self.grad_clip_norm)
         self.actor_opt.step()
@@ -258,7 +250,7 @@ class IQLAgent:
         # 3) critic update
         self.critic_opt.zero_grad(set_to_none=True)
         c_loss, c_info = self.critic_loss(
-            batch["obs"], batch["actions"], batch["next_obs"], batch["rewards"], batch["dones"], replay
+            batch["obs"], batch["actions"], batch["next_obs"], batch["rewards"], batch["dones"]
         )
         c_loss.backward()
         nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip_norm)
@@ -282,7 +274,8 @@ class IQLAgent:
     def act(self, obs: np.ndarray, replay: ReplayBuffer, deterministic: bool = True) -> np.ndarray:
         obs_t = torch.as_tensor(obs, device=self.device, dtype=torch.float32).unsqueeze(0)
         obs_n = replay.normalize_obs(obs_t)
-        act = self.actor.sample_action_chunk(obs_n)
+        n_act = self.actor.sample_action_chunk(obs_n)
+        act = replay.denormalize_act(n_act)
         return act.squeeze(0).cpu().numpy()
     
     def ema_copy(self):

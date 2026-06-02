@@ -14,6 +14,8 @@ class ReplayBuffer:
     dones: torch.Tensor
     obs_mean: torch.Tensor
     obs_std: torch.Tensor
+    act_mean: torch.Tensor
+    act_std: torch.Tensor
 
     @property
     def size(self) -> int:
@@ -32,6 +34,12 @@ class ReplayBuffer:
     def normalize_obs(self, obs: torch.Tensor) -> torch.Tensor:
         return (obs - self.obs_mean) / self.obs_std
 
+    def normalize_act(self, act: torch.Tensor) -> torch.Tensor:
+        return (act - self.act_mean) / self.act_std
+
+    def denormalize_act(self, n_act: torch.Tensor) -> torch.Tensor:
+        return self.act_std * n_act +  self.act_mean
+
 
 @dataclass
 class DatasetBundle:
@@ -43,14 +51,17 @@ class DatasetBundle:
     act_high: np.ndarray
 
 
-def load_minari_dataset(dataset_id: str, device: torch.device) -> DatasetBundle:
+def load_minari_dataset(dataset_id: str, device: torch.device, recover = True) -> DatasetBundle:
     dataset = minari.load_dataset(dataset_id)
     # Minari docs state this dataset can be recovered from the same env spec;
     # eval_env=True is the intended online evaluation env when available.
-    try:
-        env = dataset.recover_environment(eval_env=True)
-    except Exception:
-        env = dataset.recover_environment()
+    if recover:
+        try:
+            env = dataset.recover_environment(eval_env=True)
+        except Exception:
+            env = dataset.recover_environment()
+    else:
+        env = None
 
     obs_list: List[np.ndarray] = []
     act_list: List[np.ndarray] = []
@@ -81,6 +92,8 @@ def load_minari_dataset(dataset_id: str, device: torch.device) -> DatasetBundle:
 
     obs_mean = torch.as_tensor(obs_arr.mean(axis=0), device=device, dtype=torch.float32)
     obs_std = torch.as_tensor(obs_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
+    act_mean = torch.as_tensor(act_arr.mean(axis=0), device=device, dtype=torch.float32)
+    act_std = torch.as_tensor(act_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
 
     replay = ReplayBuffer(
         obs=torch.as_tensor(obs_arr, device=device, dtype=torch.float32),
@@ -90,6 +103,8 @@ def load_minari_dataset(dataset_id: str, device: torch.device) -> DatasetBundle:
         dones=torch.as_tensor(done_arr, device=device, dtype=torch.float32),
         obs_mean=obs_mean,
         obs_std=obs_std,
+        act_mean=act_mean,
+        act_std=act_std,
     )
 
     obs_space = dataset.observation_space

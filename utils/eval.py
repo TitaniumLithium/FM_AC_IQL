@@ -12,6 +12,7 @@ def evaluate_policy(
     replay,
     episodes: int,
     seed: int,
+    max_steps:int = 1000
 ) -> Dict[str, float]:
     returns: List[float] = []
     lengths: List[int] = []
@@ -32,6 +33,8 @@ def evaluate_policy(
                 ep_len += 1
                 if done:
                     break
+            if ep_len>max_steps:
+                break
 
         returns.append(ep_ret)
         lengths.append(ep_len)
@@ -48,6 +51,7 @@ def evaluate_policy_video(
     replay,
     seed,
     save_dir,
+    max_steps:int = 1000
 ) -> Dict[str, float]:
     episodes = 1
     returns: List[float] = []
@@ -76,6 +80,8 @@ def evaluate_policy_video(
                 ep_len += 1
                 if done:
                     break
+            if ep_len>max_steps:
+                break
 
         returns.append(ep_ret)
         lengths.append(ep_len)

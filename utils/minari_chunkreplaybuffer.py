@@ -15,6 +15,8 @@ class ReplayBuffer:
     dones: torch.Tensor        # [N, 1]  done at end of chunk
     obs_mean: torch.Tensor
     obs_std: torch.Tensor
+    act_mean: torch.Tensor
+    act_std: torch.Tensor
     chunk_len: int
 
     @property
@@ -24,15 +26,21 @@ class ReplayBuffer:
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         idx = torch.randint(0, self.size, (batch_size,), device=self.obs.device)
         return {
-            "obs": self.obs[idx],
-            "actions": self.actions[idx],
-            "next_obs": self.next_obs[idx],
+            "obs": self.normalize_obs(self.obs[idx]),
+            "actions": self.normalize_act(self.actions[idx]),
+            "next_obs": self.normalize_obs(self.next_obs[idx]),
             "rewards": self.rewards[idx],
             "dones": self.dones[idx],
         }
 
     def normalize_obs(self, obs: torch.Tensor) -> torch.Tensor:
         return (obs - self.obs_mean) / self.obs_std
+
+    def normalize_act(self, act: torch.Tensor) -> torch.Tensor:
+        return (act - self.act_mean) / self.act_std
+
+    def denormalize_act(self, n_act: torch.Tensor) -> torch.Tensor:
+        return self.act_std * n_act +  self.act_mean
 
 
 @dataclass
@@ -50,6 +58,7 @@ def load_minari_dataset(
     device: torch.device,
     chunk_len: int = 4,
     gamma: float = 0.99,
+    recover = True
 ) -> DatasetBundle:
     """
     Build action-chunk transitions:
@@ -62,10 +71,13 @@ def load_minari_dataset(
     dataset = minari.load_dataset(dataset_id)
     # Minari docs state this dataset can be recovered from the same env spec;
     # eval_env=True is the intended online evaluation env when available.
-    try:
-        env = dataset.recover_environment(eval_env=True)
-    except Exception:
-        env = dataset.recover_environment()
+    if recover:
+        try:
+            env = dataset.recover_environment(eval_env=True)
+        except Exception:
+            env = dataset.recover_environment()
+    else:
+        env = None
 
     obs_list: List[np.ndarray] = []
     act_list: List[np.ndarray] = []
@@ -128,6 +140,8 @@ def load_minari_dataset(
 
     obs_mean = torch.as_tensor(obs_arr.mean(axis=0), device=device, dtype=torch.float32)
     obs_std = torch.as_tensor(obs_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
+    act_mean = torch.as_tensor(act_arr.mean(axis=0), device=device, dtype=torch.float32)
+    act_std = torch.as_tensor(act_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
 
     replay = ReplayBuffer(
         obs=torch.as_tensor(obs_arr, device=device, dtype=torch.float32),
@@ -137,6 +151,8 @@ def load_minari_dataset(
         dones=torch.as_tensor(done_arr, device=device, dtype=torch.float32),
         obs_mean=obs_mean,
         obs_std=obs_std,
+        act_mean=act_mean,
+        act_std=act_std,
         chunk_len=chunk_len,
     )
 

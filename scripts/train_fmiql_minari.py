@@ -24,7 +24,8 @@ def train_agent(args):
 
     print(
         f"Dataset loaded: size={replay.size:,}, obs_dim={bundle.obs_dim}, act_dim={bundle.act_dim}, "
-        f"obs_mean_shape={tuple(replay.obs_mean.shape)}"
+        f"obs_mean_shape={tuple(replay.obs_mean.shape)} "
+        f"normalized: obs {replay.obs_mean.mean()}+-{replay.obs_std.mean()} act {replay.act_mean.mean()}+-{replay.act_std.mean()}"
     )
 
     last_path = args.save_path + "last.pt"
@@ -76,7 +77,7 @@ def train_agent(args):
 
     for epoch in pbar:
         batch = replay.sample(args.batch_size)
-        metrics = agent.update(batch, replay)
+        metrics = agent.update(batch)
         step += args.batch_size
 
         if step >= next_log_step:
@@ -122,6 +123,8 @@ def train_agent(args):
                 "value": agent.value.state_dict(),
                 "obs_mean": replay.obs_mean,
                 "obs_std": replay.obs_std,
+                "act_mean": replay.act_mean,
+                "act_std": replay.act_std,
                 "args": vars(args),
                 "best_eval_return_mean": best_eval,
             }
