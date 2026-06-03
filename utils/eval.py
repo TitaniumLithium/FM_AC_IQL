@@ -12,11 +12,13 @@ def evaluate_policy(
     replay,
     episodes: int,
     seed: int,
-    max_steps:int = 1000
+    max_steps:int = 1000,
+    use_ema = True
 ) -> Dict[str, float]:
     returns: List[float] = []
     lengths: List[int] = []
-    agent.ema_copy()
+    if use_ema:
+        agent.ema_copy()
     for ep in range(episodes):
         obs, _ = env.reset(seed=seed + ep)
         done = False
@@ -51,12 +53,14 @@ def evaluate_policy_video(
     replay,
     seed,
     save_dir,
-    max_steps:int = 1000
+    max_steps:int = 1000,
+    use_ema = True
 ) -> Dict[str, float]:
     episodes = 1
     returns: List[float] = []
     lengths: List[int] = []
-    agent.ema_copy()
+    if use_ema:
+        agent.ema_copy()
     writer = imageio.get_writer(
     save_dir,
     fps=int(1 / env.unwrapped.dt),
