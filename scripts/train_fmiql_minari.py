@@ -49,7 +49,7 @@ def train_agent(args):
     )
 
     use_wandb = bool(args.use_wandb and wandb is not None)
-    save_videos = bool(args.save_videos and args.env_id is not None)
+    save_videos = bool(args.save_videos)
 
     if args.use_wandb and wandb is None:
         print("wandb is not installed; continuing without wandb logging.")
@@ -147,7 +147,10 @@ def train_agent(args):
                 print(f"Saved best checkpoint to {best_path}")
                 if save_videos:
                     video_path = "./videos/" + f"rollout_{step}.mp4"
-                    video_eval = gym.make(args.env_id,render_mode="rgb_array")
+                    if args.env_id is not None:
+                        video_eval = gym.make(args.env_id,render_mode="rgb_array")
+                    else:
+                        video_eval = env
                     evaluate_policy_video(agent, video_eval, replay, args.seed + 1000, video_path)
                 if use_wandb:
                     artifact_best = wandb.Artifact(

@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--save_path", type=str, default="./checkpoints/")
     parser.add_argument("--chunk_len", type=int, default=4)
     parser.add_argument("--save_videos", type=int, default=0)
-    parser.add_argument("--env_id", type=str, default="Hopper-v5")
+    parser.add_argument("--env_id", type=str, default=None)
     args = parser.parse_args()
     train_agent(args)
 
