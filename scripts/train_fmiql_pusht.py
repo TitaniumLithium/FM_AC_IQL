@@ -19,7 +19,7 @@ def train_agent(args):
     print(f"Device: {device}")
     print(f"Loading dataset: {args.dataset_id}")
 
-    bundle = load_minari_dataset(args.dataset_id, device=device,recover=False)
+    bundle = load_minari_dataset(args.dataset_id, device=device,recover=False,chunk_len=args.chunk_len)
     replay = bundle.replay
     env = PushTEnv(render_mode="rgb_array")
 
