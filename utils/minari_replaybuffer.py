@@ -24,9 +24,9 @@ class ReplayBuffer:
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         idx = torch.randint(0, self.size, (batch_size,), device=self.obs.device)
         return {
-            "obs": self.obs[idx],
+            "obs": self.normalize_obs(self.obs[idx]),
             "actions": self.actions[idx],
-            "next_obs": self.next_obs[idx],
+            "next_obs": self.normalize_obs(self.next_obs[idx]),
             "rewards": self.rewards[idx],
             "dones": self.dones[idx],
         }

@@ -207,6 +207,5 @@ class IQLAgent:
     def act(self, obs: np.ndarray, replay: ReplayBuffer, deterministic: bool = True) -> np.ndarray:
         obs_t = torch.as_tensor(obs, device=self.device, dtype=torch.float32).unsqueeze(0)
         obs_n = replay.normalize_obs(obs_t)
-        n_act = self.actor.act(obs_n, deterministic=deterministic)
-        act = replay.denormalize_act(n_act)
+        act = self.actor.act(obs_n, deterministic=deterministic)
         return act.squeeze(0).cpu().numpy()
