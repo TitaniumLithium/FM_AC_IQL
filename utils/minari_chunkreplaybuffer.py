@@ -63,6 +63,7 @@ def extract_observation(obs):
 
         if "observation" in obs:
             return np.asarray(obs["observation"], dtype=np.float32)
+            print(f"extracting dict ep.observations[observation] as observation")
 
         raise ValueError(
             f"Unsupported dict observation keys: {obs.keys()}"
