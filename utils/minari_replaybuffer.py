@@ -51,6 +51,24 @@ class DatasetBundle:
     act_high: np.ndarray
 
 
+def extract_observation(obs):
+    """
+    Convert Minari observation into a flat state array.
+    """
+
+    if isinstance(obs, dict):
+
+        if "observation" in obs:
+            return np.asarray(obs["observation"], dtype=np.float32)
+            print(f"extracting dict ep.observations[observation] as observation")
+
+        raise ValueError(
+            f"Unsupported dict observation keys: {obs.keys()}"
+        )
+
+    return np.asarray(obs, dtype=np.float32)
+
+
 def load_minari_dataset(dataset_id: str, device: torch.device, recover = True) -> DatasetBundle:
     dataset = minari.load_dataset(dataset_id)
     # Minari docs state this dataset can be recovered from the same env spec;
@@ -70,7 +88,7 @@ def load_minari_dataset(dataset_id: str, device: torch.device, recover = True) -
     done_list: List[np.ndarray] = []
 
     for ep in dataset.iterate_episodes():
-        obs = np.asarray(ep.observations, dtype=np.float32)
+        obs = extract_observation(ep.observations)
         actions = np.asarray(ep.actions, dtype=np.float32)
         rewards = np.asarray(ep.rewards, dtype=np.float32)
         terminations = np.asarray(ep.terminations, dtype=np.bool_)

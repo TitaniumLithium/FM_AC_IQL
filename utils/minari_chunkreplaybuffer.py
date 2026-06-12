@@ -52,6 +52,22 @@ class DatasetBundle:
     act_low: np.ndarray
     act_high: np.ndarray
 
+def extract_observation(obs):
+    """
+    Convert Minari observation into a flat state array.
+    """
+
+    if isinstance(obs, dict):
+
+        if "observation" in obs:
+            return np.asarray(obs["observation"], dtype=np.float32)
+            print(f"extracting dict ep.observations[observation] as observation")
+
+        raise ValueError(
+            f"Unsupported dict observation keys: {obs.keys()}"
+        )
+
+    return np.asarray(obs, dtype=np.float32)
 
 def load_minari_dataset(
     dataset_id: str,
@@ -88,7 +104,7 @@ def load_minari_dataset(
     gamma_powers = (gamma ** np.arange(chunk_len, dtype=np.float32)).astype(np.float32)
 
     for ep in dataset.iterate_episodes():
-        obs = np.asarray(ep.observations, dtype=np.float32) # [T+1, obs_dim]
+        obs = extract_observation(ep.observations) # [T+1, obs_dim]
         actions = np.asarray(ep.actions, dtype=np.float32) # [T, act_dim]
         rewards = np.asarray(ep.rewards, dtype=np.float32) # [T]
         terminations = np.asarray(ep.terminations, dtype=np.bool_)
