@@ -44,9 +44,12 @@ def train_agent(args):
         critic_lr=args.critic_lr,
         value_lr=args.value_lr,
         grad_clip_norm=args.grad_clip_norm,
-        obs_horizon=1,
-        act_horizon=args.chunk_len,
-        chunk_len=args.chunk_len
+        act_horizon=args.act_horizon,
+        chunk_len=args.chunk_len,
+        unet_dims=[128, 256, 512],
+        cond_dim = 128,
+        time_emb_dim =128,
+        dropout=0.1,
     )
 
     use_wandb = bool(args.use_wandb and wandb is not None)
@@ -109,7 +112,7 @@ def train_agent(args):
 
         if step >= next_eval_step:
             next_eval_step += args.eval_interval
-            eval_metrics = evaluate_policy(agent, env, replay, episodes=args.eval_episodes, seed=args.seed + 1000,max_steps=400)
+            eval_metrics = evaluate_policy(agent, env, replay, episodes=args.eval_episodes, seed=args.seed + 1000,max_steps=400,chunk_len=args.chunk_len)
             print(
                 f"[EVAL] step={step:>7d} "
                 f"return_mean={eval_metrics['eval_return_mean']:.2f} ± {eval_metrics['eval_return_std']:.2f} "
@@ -149,7 +152,7 @@ def train_agent(args):
                 if save_videos:
                     video_path = "./videos/" + f"rollout_pusht_{step}.mp4"
                     video_eval = PushTEnv(render_mode="rgb_array")
-                    evaluate_policy_video(agent, video_eval, replay, args.seed + 1000, video_path,max_steps=400)
+                    evaluate_policy_video(agent, video_eval, replay, args.seed + 1000, video_path,max_steps=400,chunk_len=args.chunk_len)
                 if use_wandb:
                     artifact_best = wandb.Artifact(
                         name="best_agent",

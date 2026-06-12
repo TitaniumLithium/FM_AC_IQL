@@ -13,7 +13,8 @@ def evaluate_policy(
     episodes: int,
     seed: int,
     max_steps:int = 1000,
-    use_ema = True
+    use_ema = True,
+    chunk_len = 4,
 ) -> Dict[str, float]:
     returns: List[float] = []
     lengths: List[int] = []
@@ -26,7 +27,8 @@ def evaluate_policy(
         ep_len = 0
         while not done:
             action_chunk = agent.act(obs, replay=replay, deterministic=True) # [H,act_dim]
-            for h in range(action_chunk.shape[0]):
+            L = min(chunk_len,action_chunk.shape[0])
+            for h in range(L):
                 action = action_chunk[h,:]
                 action = np.clip(action, env.action_space.low, env.action_space.high)
                 obs, reward, terminated, truncated, _ = env.step(action)
@@ -54,7 +56,8 @@ def evaluate_policy_video(
     seed,
     save_dir,
     max_steps:int = 1000,
-    use_ema = True
+    use_ema = True,
+    chunk_len = 4,
 ) -> Dict[str, float]:
     episodes = 1
     returns: List[float] = []
@@ -73,7 +76,8 @@ def evaluate_policy_video(
         ep_len = 0
         while not done:
             action_chunk = agent.act(obs, replay=replay, deterministic=True) # [H,act_dim]
-            for h in range(action_chunk.shape[0]):
+            L = min(chunk_len,action_chunk.shape[0])
+            for h in range(L):
                 frame = env.render()
                 writer.append_data(frame)
                 action = action_chunk[h,:]
