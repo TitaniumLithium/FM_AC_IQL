@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple, Sequence, Optional
 import math
 
 def mlp(in_dim: int, hidden_dims: Tuple[int, ...], out_dim: int, activation=nn.ReLU) -> nn.Sequential:
@@ -62,24 +62,24 @@ def sinusoidal_embedding(tau: torch.Tensor, dim: int) -> torch.Tensor:
 
 class ObsConditionEncoder(nn.Module):
 
-    def __init__(self, obs_dim: int, d_model: int) -> None:
+    def __init__(self, obs_dim: int, cond_dim: int,max_groups: int = 8) -> None:
         super().__init__()
-        self.in_proj = nn.Conv1d(obs_dim, d_model, kernel_size=1)
+        self.in_proj = nn.Conv1d(obs_dim, cond_dim, kernel_size=1)
         self.block1 = nn.Sequential(
-            make_group_norm(d_model),
+            make_group_norm(cond_dim,max_groups),
             nn.SiLU(),
-            nn.Conv1d(d_model, d_model, kernel_size=3, padding=1),
+            nn.Conv1d(cond_dim, cond_dim, kernel_size=3, padding=1),
         )
         self.block2 = nn.Sequential(
-            make_group_norm(d_model),
+            make_group_norm(cond_dim,max_groups),
             nn.SiLU(),
-            nn.Conv1d(d_model, d_model, kernel_size=3, padding=1),
+            nn.Conv1d(cond_dim, cond_dim, kernel_size=3, padding=1),
         )
         self.out = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
+            nn.LayerNorm(cond_dim),
+            nn.Linear(cond_dim, cond_dim),
             nn.SiLU(),
-            nn.Linear(d_model, d_model),
+            nn.Linear(cond_dim, cond_dim),
         )
 
     def forward(self, obs_seq: torch.Tensor) -> torch.Tensor:
@@ -93,19 +93,37 @@ class ObsConditionEncoder(nn.Module):
 
 
 class FiLMResBlock1D(nn.Module):
-    """Residual 1D block with FiLM conditioning from a context vector."""
+    """
+    Residual 1D block with FiLM conditioning from a context vector.
+    x:    [B, C, L]
+    cond: [B, cond_dim]
+    """
 
-    def __init__(self, channels: int, cond_dim: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        cond_dim: int,
+        kernel_size: int = 3,
+        dropout: float = 0.1,
+        max_groups: int = 8,
+    ) -> None:
         super().__init__()
-        self.norm1 = make_group_norm(channels)
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
-        self.norm2 = make_group_norm(channels)
-        self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
+        assert kernel_size % 2 == 1, "kernel_size should be odd for 'same' padding."
+        padding = kernel_size // 2
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        self.norm1 = make_group_norm(in_channels, max_groups=max_groups)
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=padding)
+        self.norm2 = make_group_norm(out_channels, max_groups=max_groups)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=kernel_size, padding=padding)
         self.cond = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(cond_dim, 2 * channels),
+            nn.Linear(cond_dim, 2 * out_channels),
         )
         self.dropout = nn.Dropout(dropout)
+        self.skip = nn.Identity() if in_channels == out_channels else nn.Conv1d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         # x: [B,C,L], cond: [B,cond_dim]
@@ -139,84 +157,165 @@ class FM1DUnet(nn.Module):
         self,
         obs_dim: int,
         act_dim: int,
-        ctx_len: int,
         horizon: int,
-        d_model: int = 128,
         dropout: float = 0.1,
+        down_dims: Sequence[int] = (128, 256, 512),
+        kernel_size: int = 3,
+        cond_dim: int = 128,
+        time_emb_dim: int = 128,
+        max_groups: int = 8,
     ) -> None:
         super().__init__()
+        if len(down_dims) < 1:
+            raise ValueError("down_dims must contain at least one channel size.")
         self.obs_dim = obs_dim
         self.act_dim = act_dim
-        self.ctx_len = ctx_len
         self.horizon = horizon
-        self.d_model = d_model
+        self.down_dims = list(down_dims)
+        self.kernel_size = kernel_size
 
-        self.obs_encoder = ObsConditionEncoder(obs_dim=obs_dim, d_model=d_model)
+        base_dim = down_dims[0]
+        cond_dim = cond_dim or base_dim
+        time_emb_dim = time_emb_dim or base_dim
+
+        self.obs_encoder = ObsConditionEncoder(obs_dim=obs_dim, cond_dim=cond_dim)
         self.tau_mlp = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(time_emb_dim, cond_dim),
             nn.SiLU(),
-            nn.Linear(d_model, d_model),
+            nn.Linear(cond_dim, cond_dim),
         )
+        self.cond_fuse = nn.Linear(cond_dim, cond_dim)
+
+        in_padding = kernel_size // 2
         self.act_in = nn.Sequential(
-            nn.Conv1d(act_dim, d_model, kernel_size=1),
-            nn.GroupNorm(num_groups=max(1, min(8, d_model)), num_channels=d_model),
+            nn.Conv1d(act_dim, base_dim, kernel_size=kernel_size, padding=in_padding),
+            make_group_norm(base_dim, max_groups=max_groups),
             nn.SiLU(),
-            nn.Conv1d(d_model, d_model, kernel_size=1),
+            nn.Conv1d(base_dim, base_dim, kernel_size=kernel_size, padding=in_padding),
         )
 
-        cond_dim = d_model
+        # Encoder
+        self.enc_blocks = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
 
-        # U-Net encoder path
-        self.enc1 = FiLMResBlock1D(d_model, cond_dim, dropout=dropout)
-        self.down1 = nn.Conv1d(d_model, d_model, kernel_size=4, stride=2, padding=1)
-        self.enc2 = FiLMResBlock1D(d_model, cond_dim, dropout=dropout)
-        self.down2 = nn.Conv1d(d_model, d_model, kernel_size=4, stride=2, padding=1)
+
+        curr_channels = base_dim
+        for i, ch in enumerate(self.down_dims):
+            self.enc_blocks.append(
+                FiLMResBlock1D(
+                    in_channels=curr_channels,
+                    out_channels=ch,
+                    cond_dim=cond_dim,
+                    kernel_size=kernel_size,
+                    dropout=dropout,
+                    max_groups=max_groups,
+                )
+            )
+            curr_channels = ch
+
+            if i < len(self.down_dims) - 1:
+                next_ch = self.down_dims[i + 1]
+                # Standard strided conv downsample
+                self.downsamples.append(
+                    nn.Conv1d(curr_channels, next_ch, kernel_size=4, stride=2, padding=1)
+                )
+                curr_channels = next_ch
+
 
         # Bottleneck
-        self.mid1 = FiLMResBlock1D(d_model, cond_dim, dropout=dropout)
-        self.mid2 = FiLMResBlock1D(d_model, cond_dim, dropout=dropout)
+        self.mid_blocks = nn.ModuleList(
+            [
+                FiLMResBlock1D(
+                    in_channels=self.down_dims[-1],
+                    out_channels=self.down_dims[-1],
+                    cond_dim=cond_dim,
+                    kernel_size=kernel_size,
+                    dropout=dropout,
+                    max_groups=max_groups,
+                ),
+                FiLMResBlock1D(
+                    in_channels=self.down_dims[-1],
+                    out_channels=self.down_dims[-1],
+                    cond_dim=cond_dim,
+                    kernel_size=kernel_size,
+                    dropout=dropout,
+                    max_groups=max_groups,
+                ),
+            ]
+        )
 
-        # U-Net decoder path
-        self.up2_fuse = nn.Conv1d(2 * d_model, d_model, kernel_size=1)
-        self.dec2 = FiLMResBlock1D(d_model, cond_dim, dropout=dropout)
-        self.up1_fuse = nn.Conv1d(2 * d_model, d_model, kernel_size=1)
-        self.dec1 = FiLMResBlock1D(d_model, cond_dim, dropout=dropout)
+
+        # Decoder
+        self.up_fuse = nn.ModuleList()
+        self.dec_blocks = nn.ModuleList()
+
+
+        # Symmetric with encoder: reverse all but the deepest level
+        for i in range(len(self.down_dims) - 1, 0, -1):
+            in_ch = self.down_dims[i] + self.down_dims[i - 1]
+            out_ch = self.down_dims[i - 1]
+            self.up_fuse.append(nn.Conv1d(in_ch, out_ch, kernel_size=1))
+            self.dec_blocks.append(
+                FiLMResBlock1D(
+                    in_channels=out_ch,
+                    out_channels=out_ch,
+                    cond_dim=cond_dim,
+                    kernel_size=kernel_size,
+                    dropout=dropout,
+                    max_groups=max_groups,
+                )
+            )
 
         self.out = nn.Sequential(
-            nn.GroupNorm(num_groups=max(1, min(8, d_model)), num_channels=d_model),
+            make_group_norm(self.down_dims[0], max_groups=max_groups),
             nn.SiLU(),
-            nn.Conv1d(d_model, act_dim, kernel_size=1),
+            nn.Conv1d(self.down_dims[0], act_dim, kernel_size=1),
         )
+
+    def _build_condition(self, obs_seq: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+        """
+        obs_seq: [B, T, obs_dim]
+        tau:     [B, 1] or [B]
+        """
+        cond = self.obs_encoder(obs_seq)  # [B, cond_dim]
+
+        if tau.dim() == 1:
+            tau = tau.unsqueeze(-1)
+        tau_emb = sinusoidal_embedding(tau, self.tau_mlp[0].in_features)
+        tau_cond = self.tau_mlp(tau_emb)
+
+        cond = self.cond_fuse(cond + tau_cond)
+        return cond
 
     def forward(self, obs_seq: torch.Tensor, noisy_act: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
         # obs_seq: [B, T, obs_dim]
         # noisy_act: [B, horizon, act_dim]
         # tau: [B, 1]
-        cond = self.obs_encoder(obs_seq)  # [B, d_model]
-        tau_emb = sinusoidal_embedding(tau, self.d_model)
-        cond = cond + self.tau_mlp(tau_emb)
+        cond = self._build_condition(obs_seq, tau)
 
-        x = noisy_act.transpose(1, 2)  # [B, act_dim, horizon]
-        x = self.act_in(x)             # [B, d_model, horizon]
+        x = noisy_act.transpose(1, 2)  # [B, horizon, act_dim] -> [B, act_dim, horizon]
+        x = self.act_in(x)             # [B, act_dim, horizon]
 
-        skip1 = self.enc1(x, cond)      # [B, d_model, horizon]
-        x = self.down1(skip1)           # [B, d_model, ceil(horizon/2)]
+        skips: List[torch.Tensor] = []
 
-        skip2 = self.enc2(x, cond)      # [B, d_model, ...]
-        x = self.down2(skip2)           # [B, d_model, ...]
+        # Encoder
+        for i, block in enumerate(self.enc_blocks):
+            x = block(x, cond)
+            skips.append(x)
+            if i < len(self.downsamples):
+                x = self.downsamples[i](x)
 
-        x = self.mid1(x, cond)
-        x = self.mid2(x, cond)
+        # Bottleneck
+        for block in self.mid_blocks:
+            x = block(x, cond)
 
-        x = F.interpolate(x, size=skip2.size(-1), mode="linear", align_corners=False)
-        x = torch.cat([x, skip2], dim=1)
-        x = self.up2_fuse(x)
-        x = self.dec2(x, cond)
-
-        x = F.interpolate(x, size=skip1.size(-1), mode="linear", align_corners=False)
-        x = torch.cat([x, skip1], dim=1)
-        x = self.up1_fuse(x)
-        x = self.dec1(x, cond)
+        # Decoder
+        for i, (fuse, block) in enumerate(zip(self.up_fuse, self.dec_blocks)):
+            skip = skips[-(i + 2)]  # skip corresponding to the matching encoder level
+            x = F.interpolate(x, size=skip.size(-1), mode="linear", align_corners=False)
+            x = torch.cat([x, skip], dim=1)
+            x = fuse(x)
+            x = block(x, cond)
 
         velocity = self.out(x).transpose(1, 2)  # [B, horizon, act_dim]
         return velocity

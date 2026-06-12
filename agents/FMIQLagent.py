@@ -10,29 +10,33 @@ import copy
 
 
 class FMActor(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, device: torch.device, obs_horizon=1, act_horizon=4, hidden_dims=128, dropout=0.1):
+    def __init__(self, obs_dim: int, act_dim: int, device: torch.device, act_horizon=4, chunk_len=4, unet_dims=[128, 256, 512], cond_dim = 128, time_emb_dim = 128, dropout=0.1):
         super().__init__()
+        self.act_horizon = min(4,act_horizon)
         self.net = FM1DUnet(
             obs_dim=obs_dim,
             act_dim=act_dim,
-            ctx_len=obs_horizon,
-            horizon=act_horizon,
-            d_model=hidden_dims,
-            dropout=dropout
+            horizon=self.act_horizon,
+            down_dims=unet_dims,
+            kernel_size=3,
+            cond_dim=cond_dim,
+            time_emb_dim=time_emb_dim,
+            dropout=0.1,
         ).to(device)
         self.shadow_model = FM1DUnet(
             obs_dim=obs_dim,
             act_dim=act_dim,
-            ctx_len=obs_horizon,
-            horizon=act_horizon,
-            d_model=hidden_dims,
-            dropout=dropout
+            horizon=self.act_horizon,
+            down_dims=unet_dims,
+            kernel_size=3,
+            cond_dim=cond_dim,
+            time_emb_dim=time_emb_dim,
+            dropout=0.1,
         ).to(device)
         self.device = device
         self.act_dim = act_dim
         self.obs_dim = obs_dim
-        self.obs_horizon = obs_horizon
-        self.act_horizon = act_horizon
+        self.chunk_len = chunk_len
 
     def sample_tau(self, batch_size: int, tau_min: float = 0.0, tau_max: float = 1.0) -> torch.Tensor:
         """Shifted Beta distribution biased toward lower tau (harder noise regime)."""
@@ -135,9 +139,12 @@ class IQLAgent:
         critic_lr: float = 3e-4,
         value_lr: float = 3e-4,
         grad_clip_norm: float = 1.0,
-        obs_horizon: int = 4,
         act_horizon: int = 4,
         chunk_len: int = 4,
+        unet_dims=[128, 256, 512],
+        cond_dim = 128,
+        time_emb_dim =128,
+        dropout=0.1,
         ema_decay = 0.999,
         use_ema = True
     ):
@@ -147,11 +154,10 @@ class IQLAgent:
         self.expectile = expectile
         self.temperature = temperature
         self.grad_clip_norm = grad_clip_norm
-        self.obs_horizon = obs_horizon
         self.act_horizon = act_horizon
         self.chunk_len = chunk_len
 
-        self.actor = FMActor(obs_dim, act_dim, device, obs_horizon=obs_horizon,act_horizon=act_horizon,hidden_dims=128,dropout=0.1)
+        self.actor = FMActor(obs_dim, act_dim, device,act_horizon=act_horizon, chunk_len=chunk_len, unet_dims=unet_dims, cond_dim = cond_dim, time_emb_dim = time_emb_dim, dropout=dropout)
         self.critic = Critic(obs_dim, act_dim, chunk_len).to(device)
         self.critic_target = copy.deepcopy(self.critic).to(device)
         self.value = ValueNet(obs_dim).to(device)
