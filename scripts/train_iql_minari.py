@@ -11,7 +11,7 @@ from typing import Dict, Iterable, List, Tuple
 
 from agents.GaussianIQLagent import IQLAgent
 from utils.tools import set_seed,soft_update,to_tensor
-from utils.minari_replaybuffer import load_minari_dataset,ReplayBuffer
+from utils.minari_replaybuffer import load_minari_dataset,ReplayBuffer,extract_observation
 
 
 @torch.no_grad()
@@ -27,6 +27,7 @@ def evaluate_policy(
     lengths: List[int] = []
     for ep in range(episodes):
         obs, _ = env.reset(seed=seed + ep)
+        obs = extract_observation(obs)
         done = False
         ep_ret = 0.0
         ep_len = 0
@@ -34,6 +35,7 @@ def evaluate_policy(
             action = agent.act(obs, replay=replay, deterministic=True)
             action = np.clip(action, env.action_space.low, env.action_space.high)
             obs, reward, terminated, truncated, _ = env.step(action)
+            obs = extract_observation(obs)
             done = bool(terminated or truncated)
             ep_ret += float(reward)
             ep_len += 1
@@ -53,7 +55,7 @@ def train_agent(args):
     print(f"Device: {device}")
     print(f"Loading dataset: {args.dataset_id}")
 
-    bundle = load_minari_dataset(args.dataset_id, device=device)
+    bundle = load_minari_dataset(args.dataset_id, device=device,render_mode="rgb_array")
     replay = bundle.replay
     env = bundle.env
 

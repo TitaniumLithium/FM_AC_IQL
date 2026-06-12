@@ -3,6 +3,12 @@ import numpy as np
 import imageio
 import os
 import torch
+from utils.minari_chunkreplaybuffer import extract_observation
+
+def get_fps(env, default=30):
+    if hasattr(env.unwrapped, "dt") and env.unwrapped.dt:
+        return int(round(1.0 / env.unwrapped.dt))
+    return int(env.metadata.get("render_fps", default))
 
 
 @torch.no_grad()
@@ -22,6 +28,7 @@ def evaluate_policy(
         agent.ema_copy()
     for ep in range(episodes):
         obs, _ = env.reset(seed=seed + ep)
+        obs = extract_observation(obs)
         done = False
         ep_ret = 0.0
         ep_len = 0
@@ -32,6 +39,7 @@ def evaluate_policy(
                 action = action_chunk[h,:]
                 action = np.clip(action, env.action_space.low, env.action_space.high)
                 obs, reward, terminated, truncated, _ = env.step(action)
+                obs = extract_observation(obs)
                 done = bool(terminated or truncated)
                 ep_ret += float(reward)
                 ep_len += 1
@@ -66,11 +74,12 @@ def evaluate_policy_video(
         agent.ema_copy()
     writer = imageio.get_writer(
     save_dir,
-    fps=int(1 / env.unwrapped.dt),
+    fps=get_fps(env),
     codec="libx264"
     )
     for ep in range(episodes):
         obs, _ = env.reset(seed=seed + ep)
+        obs = extract_observation(obs)
         done = False
         ep_ret = 0.0
         ep_len = 0
@@ -83,6 +92,7 @@ def evaluate_policy_video(
                 action = action_chunk[h,:]
                 action = np.clip(action, env.action_space.low, env.action_space.high)
                 obs, reward, terminated, truncated, _ = env.step(action)
+                obs = extract_observation(obs)
                 done = bool(terminated or truncated)
                 ep_ret += float(reward)
                 ep_len += 1

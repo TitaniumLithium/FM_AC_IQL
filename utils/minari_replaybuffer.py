@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import random
 from typing import Dict, Iterable, List, Tuple
 
+from gymnasium.spaces.dict import Dict as GymDict
+
 @dataclass
 class ReplayBuffer:
     obs: torch.Tensor
@@ -68,16 +70,31 @@ def extract_observation(obs):
 
     return np.asarray(obs, dtype=np.float32)
 
+def extract_obs_shape(obs_space):
+    if isinstance(obs_space, GymDict):
+        res = obs_space.get('observation', None)
+        if res is not None:
+            print(f"Observation space is a dict, using obs_space['observation'].shape: {res.shape}")
+            return res.shape
 
-def load_minari_dataset(dataset_id: str, device: torch.device, recover = True) -> DatasetBundle:
+        raise ValueError(
+            f"Unsupported dict observation keys: {obs_space.keys()}"
+        )
+    
+    else:
+        print(f"Observation space is not a dict, using obs_space.shape: {obs_space.shape}")
+        return obs_space.shape
+
+
+def load_minari_dataset(dataset_id: str, device: torch.device, recover = True, **kwargs) -> DatasetBundle:
     dataset = minari.load_dataset(dataset_id)
     # Minari docs state this dataset can be recovered from the same env spec;
     # eval_env=True is the intended online evaluation env when available.
     if recover:
         try:
-            env = dataset.recover_environment(eval_env=True)
+            env = dataset.recover_environment(eval_env=True, **kwargs)
         except Exception:
-            env = dataset.recover_environment()
+            env = dataset.recover_environment(**kwargs)
     else:
         env = None
 
@@ -132,7 +149,7 @@ def load_minari_dataset(dataset_id: str, device: torch.device, recover = True) -
     return DatasetBundle(
         replay=replay,
         env=env,
-        obs_dim=int(np.prod(obs_space.shape)),
+        obs_dim=int(np.prod(extract_obs_shape(obs_space))),
         act_dim=int(np.prod(act_space.shape)),
         act_low=np.asarray(act_space.low, dtype=np.float32),
         act_high=np.asarray(act_space.high, dtype=np.float32),
