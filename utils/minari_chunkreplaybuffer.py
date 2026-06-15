@@ -174,8 +174,8 @@ def load_minari_dataset(
 
     obs_mean = torch.as_tensor(obs_arr.mean(axis=0), device=device, dtype=torch.float32)
     obs_std = torch.as_tensor(obs_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
-    act_mean = torch.as_tensor(act_arr.mean(axis=0), device=device, dtype=torch.float32)
-    act_std = torch.as_tensor(act_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
+    act_mean = torch.as_tensor(act_arr.reshape(n,-1).mean(axis=0), device=device, dtype=torch.float32)
+    act_std = torch.as_tensor(act_arr.reshape(n,-1).std(axis=0) + 1e-6, device=device, dtype=torch.float32)
 
     replay = ReplayBuffer(
         obs=torch.as_tensor(obs_arr, device=device, dtype=torch.float32),

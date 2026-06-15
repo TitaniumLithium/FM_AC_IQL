@@ -18,7 +18,7 @@ def train_agent(args):
     print(f"Device: {device}")
     print(f"Loading dataset: {args.dataset_id}")
 
-    bundle = load_minari_dataset(args.dataset_id, device=device,render_mode="rgb_array")
+    bundle = load_minari_dataset(args.dataset_id, device=device,render_mode="rgb_array",horizon=args.act_horizon)
     replay = bundle.replay
     env = bundle.env
 
