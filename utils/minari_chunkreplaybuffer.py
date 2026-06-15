@@ -11,7 +11,7 @@ from gymnasium.spaces.dict import Dict as GymDict
 class ReplayBuffer:
     # obs[t] is the starting state of the chunk
     obs: torch.Tensor          # [N, obs_dim]
-    actions: torch.Tensor      # [N, chunk_len, act_dim]
+    actions: torch.Tensor      # [N, horizon, act_dim]
     next_obs: torch.Tensor     # [N, obs_dim]
     rewards: torch.Tensor      # [N, 1]  discounted chunk return
     dones: torch.Tensor        # [N, 1]  done at end of chunk
@@ -19,7 +19,7 @@ class ReplayBuffer:
     obs_std: torch.Tensor
     act_mean: torch.Tensor
     act_std: torch.Tensor
-    chunk_len: int
+    horizon: int
 
     @property
     def size(self) -> int:
@@ -89,7 +89,7 @@ def extract_obs_shape(obs_space):
 def load_minari_dataset(
     dataset_id: str,
     device: torch.device,
-    chunk_len: int = 4,
+    horizon: int = 4,
     gamma: float = 0.99,
     recover = True,
     **kwargs
@@ -118,8 +118,9 @@ def load_minari_dataset(
     next_obs_list: List[np.ndarray] = []
     rew_list: List[np.ndarray] = []
     done_list: List[np.ndarray] = []
+    all_act_list: List[np.ndarray] = []
 
-    gamma_powers = (gamma ** np.arange(chunk_len, dtype=np.float32)).astype(np.float32)
+    gamma_powers = (gamma ** np.arange(horizon, dtype=np.float32)).astype(np.float32)
 
     for ep in dataset.iterate_episodes():
         obs = extract_observation(ep.observations) # [T+1, obs_dim]
@@ -129,15 +130,17 @@ def load_minari_dataset(
         truncations = np.asarray(ep.truncations, dtype=np.bool_)
         dones = np.logical_or(terminations, truncations)
 
+        all_act_list.append(actions)
+
         T = actions.shape[0]
-        if T < chunk_len:
+        if T < horizon:
             continue
 
         # Sliding window inside the episode.
-        # start t: 0 .. T-chunk_len
+        # start t: 0 .. T-horizon
 
-        for t in range(T - chunk_len + 1):
-            end = t + chunk_len
+        for t in range(T - horizon + 1):
+            end = t + horizon
 
             # Optional safety check:
             # do not let the chunk cross an earlier terminal/truncation.
@@ -149,7 +152,7 @@ def load_minari_dataset(
             chunk_done = float(dones[end - 1])
 
             obs_list.append(obs[t])                     # starting state
-            act_list.append(actions[t:end])             # [chunk_len, act_dim]
+            act_list.append(actions[t:end])             # [horizon, act_dim]
             next_obs_list.append(obs[end])              # state after chunk
             rew_list.append(np.array([chunk_reward], dtype=np.float32))
             done_list.append(np.array([chunk_done], dtype=np.float32))
@@ -157,25 +160,28 @@ def load_minari_dataset(
 
     if len(obs_list) == 0:
         raise ValueError(
-            f"No valid chunk samples found. dataset_id={dataset_id}, chunk_len={chunk_len}"
+            f"No valid chunk samples found. dataset_id={dataset_id}, horizon={horizon}"
         )
 
     obs_arr = np.stack(obs_list, axis=0)                    # [N, obs_dim]
-    act_arr = np.stack(act_list, axis=0)                   # [N, chunk_len, act_dim]
+    act_arr = np.stack(act_list, axis=0)                   # [N, horizon, act_dim]
     next_obs_arr = np.stack(next_obs_list, axis=0)         # [N, obs_dim]
     rew_arr = np.concatenate(rew_list, axis=0)[:, None]    # [N, 1]
     done_arr = np.concatenate(done_list, axis=0)[:, None]  # [N, 1]
+
+    all_act_arr = np.concatenate(all_act_list, axis=0) # [N, act_dim]
     
     n = obs_arr.shape[0]
     assert act_arr.shape[0] == n
     assert next_obs_arr.shape[0] == n
     assert rew_arr.shape[0] == n
     assert done_arr.shape[0] == n
+    assert all_act_arr.shape[0] == n + dataset.total_episodes* (horizon - 1)
 
     obs_mean = torch.as_tensor(obs_arr.mean(axis=0), device=device, dtype=torch.float32)
     obs_std = torch.as_tensor(obs_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
-    act_mean = torch.as_tensor(act_arr.reshape(n,-1).mean(axis=0), device=device, dtype=torch.float32)
-    act_std = torch.as_tensor(act_arr.reshape(n,-1).std(axis=0) + 1e-6, device=device, dtype=torch.float32)
+    act_mean = torch.as_tensor(all_act_arr.mean(axis=0), device=device, dtype=torch.float32)
+    act_std = torch.as_tensor(all_act_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
 
     replay = ReplayBuffer(
         obs=torch.as_tensor(obs_arr, device=device, dtype=torch.float32),
@@ -187,7 +193,7 @@ def load_minari_dataset(
         obs_std=obs_std,
         act_mean=act_mean,
         act_std=act_std,
-        chunk_len=chunk_len,
+        horizon=horizon,
     )
 
     obs_space = dataset.observation_space
