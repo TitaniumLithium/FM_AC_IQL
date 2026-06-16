@@ -54,7 +54,7 @@ class FMActor(nn.Module):
         obs: torch.Tensor,
         target_act: torch.Tensor,
         noise_scale: float = 1.0,
-    ) -> Tuple[torch.Tensor, dict]:
+    ):
         """Conditional flow matching with linear path x_tau = tau*x1 + (1-tau)*eps."""
         device = self.device
         model = self.net
@@ -71,10 +71,7 @@ class FMActor(nn.Module):
         err = (pred_velocity - target_velocity)**2
         loss = err.mean(dim=(1,2))   # [B]
 
-        metrics = {
-            "loss": loss.detach()
-        }
-        return loss, metrics
+        return loss
 
     @torch.no_grad()
     def sample_action_chunk(
@@ -168,7 +165,7 @@ class IQLAgent:
         
         self.ema = EMA(self.actor.net, decay=ema_decay) if use_ema else None
 
-    def value_loss(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def value_loss(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         '''
         obs [B, obs_dim]
         actions [B, H, act_dim]
@@ -181,10 +178,10 @@ class IQLAgent:
         weight = torch.where(diff > 0, self.expectile, 1.0 - self.expectile)
         loss = (weight * diff.square()).mean()
         info = {
-            "value_loss": float(loss.detach().cpu()),
-            "v_mean": float(v.mean().detach().cpu()),
-            "q_target_mean": float(q.mean().detach().cpu()),
-            "expectile_weight_mean": float(weight.mean().detach().cpu()),
+            "value_loss": loss.detach(),
+            "v_mean": v.mean().detach(),
+            "q_target_mean": q.mean().detach(),
+            "expectile_weight_mean": weight.mean().detach(),
         }
         return loss, info
 
@@ -195,7 +192,7 @@ class IQLAgent:
         next_obs: torch.Tensor,
         rewards: torch.Tensor,
         dones: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         chunk_gamma = self.gamma ** self.chunk_len
         with torch.no_grad():
             target_v = self.value(next_obs)
@@ -205,14 +202,14 @@ class IQLAgent:
         loss2 = F.mse_loss(q2, target_q)
         loss = loss1 + loss2
         info = {
-            "critic_loss": float(loss.detach().cpu()),
-            "q1_mean": float(q1.mean().detach().cpu()),
-            "q2_mean": float(q2.mean().detach().cpu()),
-            "target_q_mean": float(target_q.mean().detach().cpu()),
+            "critic_loss": loss.detach(),
+            "q1_mean": q1.mean().detach(),
+            "q2_mean": q2.mean().detach(),
+            "target_q_mean": target_q.mean().detach(),
         }
         return loss, info
 
-    def actor_loss(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def actor_loss(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         with torch.no_grad():
             q1, q2 = self.critic_target(obs, actions)
             q = torch.min(q1, q2)
@@ -223,19 +220,19 @@ class IQLAgent:
             weights = torch.exp(torch.clamp(adv * self.temperature, max=100.0))
             weights = torch.clamp(weights, max=100.0) #[B,1]
 
-        fm_loss, _ = self.actor.flow_match_loss(obs,actions) # [B]
+        fm_loss = self.actor.flow_match_loss(obs,actions) # [B]
         fm_loss = fm_loss.reshape(-1,1)
 
         loss = (weights * fm_loss).mean()
         info = {
-            "actor_loss": float(loss.detach().cpu()),
-            "adv_mean": float(adv.mean().detach().cpu()),
-            "weight_mean": float(weights.mean().detach().cpu()),
+            "actor_loss": loss.detach(),
+            "adv_mean": adv.mean().detach(),
+            "weight_mean": weights.mean().detach(),
         }
         return loss, info
 
-    def update(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        metrics: Dict[str, float] = {}
+    def update(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        metrics: Dict[str, torch.Tensor] = {}
 
         # 1) value update
         self.value_opt.zero_grad(set_to_none=True)
@@ -270,8 +267,8 @@ class IQLAgent:
 
         metrics.update(
             {
-                "loss_total": float((v_loss + a_loss + c_loss).detach().cpu()),
-                "critic_q_gap": float(abs(metrics["q1_mean"] - metrics["q2_mean"])),
+                "loss_total": (v_loss + a_loss + c_loss).detach(),
+                "critic_q_gap": abs(metrics["q1_mean"] - metrics["q2_mean"]),
             }
         )
         return metrics

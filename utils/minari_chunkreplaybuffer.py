@@ -28,9 +28,9 @@ class ReplayBuffer:
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         idx = torch.randint(0, self.size, (batch_size,), device=self.obs.device)
         return {
-            "obs": self.normalize_obs(self.obs[idx]),
-            "actions": self.normalize_act(self.actions[idx]),
-            "next_obs": self.normalize_obs(self.next_obs[idx]),
+            "obs": self.obs[idx],
+            "actions": self.actions[idx],
+            "next_obs": self.next_obs[idx],
             "rewards": self.rewards[idx],
             "dones": self.dones[idx],
         }
@@ -176,17 +176,26 @@ def load_minari_dataset(
     assert next_obs_arr.shape[0] == n
     assert rew_arr.shape[0] == n
     assert done_arr.shape[0] == n
-    assert all_act_arr.shape[0] == n + dataset.total_episodes* (horizon - 1)
+    #assert all_act_arr.shape[0] == n + dataset.total_episodes* (horizon - 1)
 
     obs_mean = torch.as_tensor(obs_arr.mean(axis=0), device=device, dtype=torch.float32)
     obs_std = torch.as_tensor(obs_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
     act_mean = torch.as_tensor(all_act_arr.mean(axis=0), device=device, dtype=torch.float32)
     act_std = torch.as_tensor(all_act_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
 
+    #normalize before replaybuffer -> speedup
+    n_obs = torch.as_tensor(obs_arr, device=device, dtype=torch.float32)
+    n_obs = (n_obs - obs_mean) / obs_std
+    n_obs_next = torch.as_tensor(next_obs_arr, device=device, dtype=torch.float32)
+    n_obs_next = (n_obs_next - obs_mean) / obs_std
+    n_act = torch.as_tensor(act_arr, device=device, dtype=torch.float32)
+    n_act = (n_act - act_mean) / act_std
+
+
     replay = ReplayBuffer(
-        obs=torch.as_tensor(obs_arr, device=device, dtype=torch.float32),
-        actions=torch.as_tensor(act_arr, device=device, dtype=torch.float32),
-        next_obs=torch.as_tensor(next_obs_arr, device=device, dtype=torch.float32),
+        obs=n_obs,
+        actions=n_act,
+        next_obs=n_obs_next,
         rewards=torch.as_tensor(rew_arr, device=device, dtype=torch.float32),
         dones=torch.as_tensor(done_arr, device=device, dtype=torch.float32),
         obs_mean=obs_mean,

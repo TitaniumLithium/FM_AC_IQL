@@ -81,6 +81,7 @@ def train_agent(args):
     for epoch in pbar:
         batch = replay.sample(args.batch_size)
         metrics = agent.update(batch)
+        metrics = {k: v.item() for k, v in metrics.items()}
         step += args.batch_size
 
         if step >= next_log_step:
