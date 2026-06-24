@@ -45,7 +45,7 @@ def train_agent(args):
         grad_clip_norm=args.grad_clip_norm,
         act_horizon=args.act_horizon,
         chunk_len=args.chunk_len,
-        unet_dims=[128, 256, 512],
+        unet_dims=[128, 256],
         cond_dim = 128,
         time_emb_dim =128,
         dropout=0.1,

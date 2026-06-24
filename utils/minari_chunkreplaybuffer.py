@@ -119,6 +119,7 @@ def load_minari_dataset(
     rew_list: List[np.ndarray] = []
     done_list: List[np.ndarray] = []
     all_act_list: List[np.ndarray] = []
+    all_obs_list: List[np.ndarray] = []
 
     gamma_powers = (gamma ** np.arange(horizon, dtype=np.float32)).astype(np.float32)
 
@@ -131,6 +132,7 @@ def load_minari_dataset(
         dones = np.logical_or(terminations, truncations)
 
         all_act_list.append(actions)
+        all_obs_list.append(obs)
 
         T = actions.shape[0]
         if T < horizon:
@@ -151,11 +153,11 @@ def load_minari_dataset(
             chunk_reward = float(np.sum(rewards[t:end] * gamma_powers))
             chunk_done = float(dones[end - 1])
 
-            obs_list.append(obs[t])                     # starting state
+            obs_list.append(obs[t:end])                     # starting state
             act_list.append(actions[t:end])             # [horizon, act_dim]
-            next_obs_list.append(obs[end])              # state after chunk
-            rew_list.append(np.array([chunk_reward], dtype=np.float32))
-            done_list.append(np.array([chunk_done], dtype=np.float32))
+            next_obs_list.append(obs[t+1:end+1])              # state after chunk
+            rew_list.append(rewards[t:end])             # [horizon]
+            done_list.append(dones[t:end])
 
 
     if len(obs_list) == 0:
@@ -163,13 +165,14 @@ def load_minari_dataset(
             f"No valid chunk samples found. dataset_id={dataset_id}, horizon={horizon}"
         )
 
-    obs_arr = np.stack(obs_list, axis=0)                    # [N, obs_dim]
+    obs_arr = np.stack(obs_list, axis=0)                    # [N, horizon, obs_dim]
     act_arr = np.stack(act_list, axis=0)                   # [N, horizon, act_dim]
-    next_obs_arr = np.stack(next_obs_list, axis=0)         # [N, obs_dim]
-    rew_arr = np.concatenate(rew_list, axis=0)[:, None]    # [N, 1]
-    done_arr = np.concatenate(done_list, axis=0)[:, None]  # [N, 1]
+    next_obs_arr = np.stack(next_obs_list, axis=0)         # [N, horizon, obs_dim]
+    rew_arr = np.stack(rew_list, axis=0)   # [N, horizon]
+    done_arr = np.stack(done_list, axis=0)  # [N, horizon]
 
     all_act_arr = np.concatenate(all_act_list, axis=0) # [N, act_dim]
+    all_obs_arr = np.concatenate(all_obs_list, axis=0) # [N, obs_dim]
     
     n = obs_arr.shape[0]
     assert act_arr.shape[0] == n
@@ -178,8 +181,8 @@ def load_minari_dataset(
     assert done_arr.shape[0] == n
     #assert all_act_arr.shape[0] == n + dataset.total_episodes* (horizon - 1)
 
-    obs_mean = torch.as_tensor(obs_arr.mean(axis=0), device=device, dtype=torch.float32)
-    obs_std = torch.as_tensor(obs_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
+    obs_mean = torch.as_tensor(all_obs_arr.mean(axis=0), device=device, dtype=torch.float32)
+    obs_std = torch.as_tensor(all_obs_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
     act_mean = torch.as_tensor(all_act_arr.mean(axis=0), device=device, dtype=torch.float32)
     act_std = torch.as_tensor(all_act_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
 

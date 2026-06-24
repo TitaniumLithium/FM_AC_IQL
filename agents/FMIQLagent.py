@@ -97,19 +97,17 @@ class FMActor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, chunk_len: int, hidden_dims=(256, 256)):
+    def __init__(self, obs_dim: int, act_dim: int, hidden_dims=(256, 256)):
         super().__init__()
-        self.q1 = mlp(obs_dim + act_dim * chunk_len, hidden_dims, 1)
-        self.q2 = mlp(obs_dim + act_dim * chunk_len, hidden_dims, 1)
-        self.chunk_dim = act_dim * chunk_len
+        self.q1 = mlp(obs_dim + act_dim, hidden_dims, 1)
+        self.q2 = mlp(obs_dim + act_dim, hidden_dims, 1)
 
-    def forward(self, obs: torch.Tensor, action_chunk: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         '''
         obs [B, obs_dim]
-        action_chunk [B, H, act_dim]
+        action [B, act_dim]
         '''
-        act = action_chunk.reshape(-1,self.chunk_dim)
-        x = torch.cat([obs, act], dim=-1)
+        x = torch.cat([obs, action], dim=-1)
         return self.q1(x), self.q2(x)
 
 
@@ -153,9 +151,11 @@ class IQLAgent:
         self.grad_clip_norm = grad_clip_norm
         self.act_horizon = act_horizon
         self.chunk_len = chunk_len
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
 
         self.actor = FMActor(obs_dim, act_dim, device,act_horizon=act_horizon, chunk_len=chunk_len, unet_dims=unet_dims, cond_dim = cond_dim, time_emb_dim = time_emb_dim, dropout=dropout)
-        self.critic = Critic(obs_dim, act_dim, chunk_len).to(device)
+        self.critic = Critic(obs_dim, act_dim).to(device)
         self.critic_target = copy.deepcopy(self.critic).to(device)
         self.value = ValueNet(obs_dim).to(device)
 
@@ -165,10 +165,12 @@ class IQLAgent:
         
         self.ema = EMA(self.actor.net, decay=ema_decay) if use_ema else None
 
+        self.gamma_powers = (self.gamma ** torch.arange(self.act_horizon, dtype=torch.float32))[None, :, None].to(device)
+
     def value_loss(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         '''
         obs [B, obs_dim]
-        actions [B, H, act_dim]
+        actions [B, act_dim]
         '''
         with torch.no_grad():
             q1_t, q2_t = self.critic_target(obs, actions)
@@ -193,10 +195,9 @@ class IQLAgent:
         rewards: torch.Tensor,
         dones: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        chunk_gamma = self.gamma ** self.chunk_len
         with torch.no_grad():
             target_v = self.value(next_obs)
-            target_q = rewards + chunk_gamma * (1.0 - dones) * target_v
+            target_q = rewards + self.gamma * (1.0 - dones) * target_v.detach()
         q1, q2 = self.critic(obs, actions)
         loss1 = F.mse_loss(q1, target_q)
         loss2 = F.mse_loss(q2, target_q)
@@ -209,24 +210,28 @@ class IQLAgent:
         }
         return loss, info
 
-    def actor_loss(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def actor_loss(self, obs_chunk: torch.Tensor, action_chunk: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        init_obs = obs_chunk[:, 0, :]
         with torch.no_grad():
-            q1, q2 = self.critic_target(obs, actions)
+            q1, q2 = self.critic_target(obs_chunk, action_chunk)
             q = torch.min(q1, q2)
-            v = self.value(obs)
+            v = self.value(obs_chunk)
             adv = q - v
+            dist_adv = adv * self.gamma_powers # [B,H,1]
+            dist_adv = dist_adv.squeeze()
+            chunk_adv = dist_adv.mean(dim=-1, keepdim=True)
             # IQL paper uses advantage-weighted regression. In the official JAX code,
             # temperature is a multiplier on advantage, so larger values sharpen the weights.
-            weights = torch.exp(torch.clamp(adv * self.temperature, max=100.0))
+            weights = torch.exp(torch.clamp(chunk_adv.detach() * self.temperature, max=100.0))
             weights = torch.clamp(weights, max=100.0) #[B,1]
 
-        fm_loss = self.actor.flow_match_loss(obs,actions) # [B]
+        fm_loss = self.actor.flow_match_loss(init_obs,action_chunk) # [B]
         fm_loss = fm_loss.reshape(-1,1)
 
         loss = (weights * fm_loss).mean()
         info = {
             "actor_loss": loss.detach(),
-            "adv_mean": adv.mean().detach(),
+            "adv_mean": chunk_adv.mean().detach(),
             "weight_mean": weights.mean().detach(),
         }
         return loss, info
@@ -236,7 +241,7 @@ class IQLAgent:
 
         # 1) value update
         self.value_opt.zero_grad(set_to_none=True)
-        v_loss, v_info = self.value_loss(batch["obs"], batch["actions"])
+        v_loss, v_info = self.value_loss(batch["obs"].reshape(-1,self.obs_dim), batch["actions"].reshape(-1,self.act_dim))
         v_loss.backward()
         nn.utils.clip_grad_norm_(self.value.parameters(), self.grad_clip_norm)
         self.value_opt.step()
@@ -253,7 +258,7 @@ class IQLAgent:
         # 3) critic update
         self.critic_opt.zero_grad(set_to_none=True)
         c_loss, c_info = self.critic_loss(
-            batch["obs"], batch["actions"], batch["next_obs"], batch["rewards"], batch["dones"]
+            batch["obs"].reshape(-1,self.obs_dim), batch["actions"].reshape(-1,self.act_dim), batch["next_obs"].reshape(-1,self.obs_dim), batch["rewards"].reshape(-1,1), batch["dones"].reshape(-1,1)
         )
         c_loss.backward()
         nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip_norm)
