@@ -61,35 +61,32 @@ def sinusoidal_embedding(tau: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class ObsConditionEncoder(nn.Module):
-
-    def __init__(self, obs_dim: int, cond_dim: int,max_groups: int = 8) -> None:
+    def __init__(self, obs_dim: int, cond_dim: int, max_groups: int = 8) -> None:
         super().__init__()
-        self.in_proj = nn.Conv1d(obs_dim, cond_dim, kernel_size=1)
-        self.block1 = nn.Sequential(
-            make_group_norm(cond_dim,max_groups),
-            nn.SiLU(),
-            nn.Conv1d(cond_dim, cond_dim, kernel_size=3, padding=1),
-        )
-        self.block2 = nn.Sequential(
-            make_group_norm(cond_dim,max_groups),
-            nn.SiLU(),
-            nn.Conv1d(cond_dim, cond_dim, kernel_size=3, padding=1),
-        )
-        self.out = nn.Sequential(
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, cond_dim),
             nn.LayerNorm(cond_dim),
+            nn.SiLU(),
             nn.Linear(cond_dim, cond_dim),
             nn.SiLU(),
             nn.Linear(cond_dim, cond_dim),
         )
 
     def forward(self, obs_seq: torch.Tensor) -> torch.Tensor:
-        # obs_seq: [B, obs_T, obs_dim]
-        x = obs_seq.transpose(1, 2)  # [B, obs_dim, obs_T]
-        x = self.in_proj(x)
-        x = x + self.block1(x)
-        x = x + self.block2(x)
-        x = x.mean(dim=-1)  # [B, d_model]
-        return self.out(x)
+        # obs_seq: [B, obs_h, obs_dim]
+        x = obs_seq.mean(dim=1)  # [B, obs_dim], works for obs_h=1 and >1
+        return self.net(x)
+
+
+def _match_length(x: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Pad/crop temporal length to target_len."""
+    cur_len = x.size(-1)
+    if cur_len == target_len:
+        return x
+    if cur_len > target_len:
+        return x[..., :target_len]
+    return F.pad(x, (0, target_len - cur_len))
+
 
 
 class FiLMResBlock1D(nn.Module):
@@ -122,23 +119,29 @@ class FiLMResBlock1D(nn.Module):
             nn.SiLU(),
             nn.Linear(cond_dim, 2 * out_channels),
         )
-        self.dropout = nn.Dropout(dropout)
-        self.skip = nn.Identity() if in_channels == out_channels else nn.Conv1d(in_channels, out_channels, kernel_size=1)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.skip = (
+            nn.Identity()
+            if in_channels == out_channels
+            else nn.Conv1d(in_channels, out_channels, kernel_size=1)
+        )
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         # x: [B,C,L], cond: [B,cond_dim]
-        scale_shift = self.cond(cond).unsqueeze(-1)  # [B, 2C, 1]
+        h = self.norm1(x)
+        h = F.silu(h)
+        h = self.conv1(h)
+
+        scale_shift = self.cond(cond).unsqueeze(-1)  # [B, 2*out_channels, 1]
         scale, shift = scale_shift.chunk(2, dim=1)
 
-        h = self.norm1(x)
+        h = self.norm2(h)
         h = h * (1.0 + scale) + shift
         h = F.silu(h)
-        h = self.dropout(self.conv1(h))
+        h = self.dropout(h)
+        h = self.conv2(h)
 
-        h = self.norm2(h)
-        h = F.silu(h)
-        h = self.dropout(self.conv2(h))
-        return x + h
+        return self.skip(x) + h
 
 
 class FM1DUnet(nn.Module):
@@ -246,19 +249,22 @@ class FM1DUnet(nn.Module):
 
 
         # Decoder
-        self.up_fuse = nn.ModuleList()
+        self.upsamples = nn.ModuleList()
         self.dec_blocks = nn.ModuleList()
 
 
         # Symmetric with encoder: reverse all but the deepest level
         for i in range(len(self.down_dims) - 1, 0, -1):
-            in_ch = self.down_dims[i] + self.down_dims[i - 1]
-            out_ch = self.down_dims[i - 1]
-            self.up_fuse.append(nn.Conv1d(in_ch, out_ch, kernel_size=1))
+            deep_ch = self.down_dims[i]
+            skip_ch = self.down_dims[i - 1]
+
+            self.upsamples.append(
+                nn.ConvTranspose1d(deep_ch, skip_ch, kernel_size=4, stride=2, padding=1)
+            )
             self.dec_blocks.append(
                 FiLMResBlock1D(
-                    in_channels=out_ch,
-                    out_channels=out_ch,
+                    in_channels=skip_ch * 2,
+                    out_channels=skip_ch,
                     cond_dim=cond_dim,
                     kernel_size=kernel_size,
                     dropout=dropout,
@@ -301,8 +307,8 @@ class FM1DUnet(nn.Module):
         # Encoder
         for i, block in enumerate(self.enc_blocks):
             x = block(x, cond)
-            skips.append(x)
-            if i < len(self.downsamples):
+            if i < len(self.enc_blocks) - 1:
+                skips.append(x)
                 x = self.downsamples[i](x)
 
         # Bottleneck
@@ -310,12 +316,11 @@ class FM1DUnet(nn.Module):
             x = block(x, cond)
 
         # Decoder
-        for i, (fuse, block) in enumerate(zip(self.up_fuse, self.dec_blocks)):
-            skip = skips[-(i + 2)]  # skip corresponding to the matching encoder level
-            x = F.interpolate(x, size=skip.size(-1), mode="linear", align_corners=False)
-            x = torch.cat([x, skip], dim=1)
-            x = fuse(x)
-            x = block(x, cond)
+        for skip, upsample, block in zip(reversed(skips), self.upsamples, self.dec_blocks):
+            x = upsample(x)                         # [B, skip_ch, ?]
+            x = _match_length(x, skip.size(-1))     # temporal alignment
+            x = torch.cat([x, skip], dim=1)         # [B, 2*skip_ch, L]
+            x = block(x, cond)                      # [B, skip_ch, L]
 
         velocity = self.out(x).transpose(1, 2)  # [B, horizon, act_dim]
         return velocity
