@@ -46,7 +46,7 @@ def train_agent(args):
         grad_clip_norm=args.grad_clip_norm,
         act_horizon=args.act_horizon,
         chunk_len=args.chunk_len,
-        unet_dims=[128, 256, 512],
+        unet_dims=[128, 256],
         cond_dim = 128,
         time_emb_dim =128,
         dropout=0.1,
@@ -77,6 +77,7 @@ def train_agent(args):
     print(f"num_epochs = {args.num_steps}//{args.batch_size} + 1 = {num_epochs}")
 
     best_eval = -float("inf")
+    best_rate = 0.0
     pbar = tqdm(range(1, num_epochs + 1), desc="training", dynamic_ncols=True)
 
     for epoch in pbar:
@@ -114,11 +115,28 @@ def train_agent(args):
         if step >= next_eval_step:
             next_eval_step += args.eval_interval
             eval_metrics = evaluate_policy(agent, env, replay, episodes=args.eval_episodes, seed=args.seed + 1000,max_steps=400,chunk_len=args.chunk_len)
+            
+            infos = eval_metrics["infos"]
+            success_rate = 0.0
+            for i,info in enumerate(infos):
+                if info["success"]:
+                    success_rate += 1
+            success_rate /= len(infos)
+            
             print(
                 f"[EVAL] step={step:>7d} "
                 f"return_mean={eval_metrics['eval_return_mean']:.2f} ± {eval_metrics['eval_return_std']:.2f} "
-                f"len_mean={eval_metrics['eval_length_mean']:.1f}"
+                f"len_mean={eval_metrics['eval_length_mean']:.1f} "
+                f"success_rate={success_rate}"
             )
+            
+            log_metrics = {
+                "eval_return_mean": eval_metrics['eval_return_mean'],
+                "eval_return_std": eval_metrics['eval_return_std'],
+                "eval_length_mean": eval_metrics['eval_length_mean'],
+                "infos": success_rate
+            }
+            
             last_path = args.save_path + f"pusht_last_{step}.pt"
 
             ckpt = {
@@ -137,7 +155,7 @@ def train_agent(args):
             torch.save(ckpt, last_path)
 
             if use_wandb:
-                wandb.log({**eval_metrics, "step": step, "epoch": epoch}, step=epoch)
+                wandb.log({**log_metrics, "step": step, "epoch": epoch}, step=epoch)
                 artifact_last = wandb.Artifact(
                     name=f"last_agent_{step}",
                     type="model"
@@ -146,8 +164,9 @@ def train_agent(args):
                 wandb.log_artifact(artifact_last)
             
 
-            if eval_metrics["eval_return_mean"] > best_eval:
+            if eval_metrics["eval_return_mean"] > best_eval and success_rate > best_rate:
                 best_eval = eval_metrics["eval_return_mean"]
+                best_rate = success_rate
                 torch.save(ckpt, best_path)
                 print(f"Saved best checkpoint to {best_path}")
                 if save_videos:
