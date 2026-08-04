@@ -325,3 +325,94 @@ class FM1DUnet(nn.Module):
         velocity = self.out(x).transpose(1, 2)  # [B, horizon, act_dim]
         return velocity
 
+
+class FMTFnet(nn.Module):
+    """conditional flow-matching using a TF backbone.
+
+    Input:
+      - normalized observation sequence [B, T, obs_dim]
+      - noisy action chunk [B, horizon, act_dim]
+      - scalar flow time tau [B, 1]
+
+    Output:
+      - predicted velocity field [B, horizon, act_dim]
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        horizon: int,
+        dropout: float = 0.1,
+        cond_dim: int = 128,
+        time_emb_dim: int = 128,
+        max_groups: int = 8,
+    ) -> None:
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.horizon = horizon
+        self.time_emb_dim = time_emb_dim
+
+        self.obs_encoder = nn.Sequential(
+            nn.Linear(obs_dim, cond_dim),
+            nn.LayerNorm(cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
+        self.act_encoder = nn.Sequential(
+            nn.Linear(act_dim, cond_dim),
+            nn.LayerNorm(cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
+        self.tau_mlp = nn.Sequential(
+            nn.Linear(time_emb_dim, cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
+
+        self.obs_pos = nn.Parameter(torch.randn(1, 1, cond_dim) * 0.02)
+        self.act_pos = nn.Parameter(torch.randn(1, horizon, cond_dim) * 0.02)
+        self.ctx_summary = nn.Parameter(torch.randn(1, 1, cond_dim) * 0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=cond_dim,
+            nhead=8,
+            dim_feedforward=1024,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
+        )
+        self.blocks = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        self.final = nn.Sequential(
+            nn.LayerNorm(cond_dim),
+            nn.Linear(cond_dim, cond_dim),
+            nn.GELU(),
+            nn.Linear(cond_dim, act_dim),
+        )
+
+    def forward(self, obs: torch.Tensor, noisy_act: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+        # obs: [B, 1, obs_dim]
+        # noisy_act: [B, horizon, act_dim]
+        # tau: [B, 1]
+        B = obs.shape[0]
+
+        obs_tokens = self.obs_encoder(obs) + self.obs_pos[:, : obs.size(1)]
+        obs_tokens = self.blocks(obs_tokens)
+        ctx = obs_tokens[:, -1:, :]  # summarize with the most recent observation token
+
+        tau_emb = sinusoidal_embedding(tau, self.time_emb_dim)
+        tau_emb = self.tau_mlp(tau_emb).unsqueeze(1)  # [B,1,C]
+
+        act_tokens = self.act_encoder(noisy_act) + self.act_pos[:, : noisy_act.size(1)]
+        act_tokens = act_tokens + tau_emb
+
+        # Prefix-style conditioning, similar in spirit to a context block.
+        prefix = ctx + self.ctx_summary
+        x = torch.cat([prefix, act_tokens], dim=1)
+        x = self.blocks(x)
+        act_hidden = x[:, 1:, :]
+        velocity = self.final(act_hidden)
+        return velocity
