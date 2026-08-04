@@ -7,20 +7,97 @@ import wandb
 import minari
 import os
 import gymnasium as gym
+from typing import Dict, Iterable, List, Tuple
+import imageio
 
-from agents.FMIQLagent import IQLAgent
-from utils.eval import evaluate_policy,evaluate_policy_video
-from utils.tools import set_seed,soft_update
-from utils.minari_chunkreplaybuffer import load_minari_dataset
+from envs.symmetric_2goal import SymmetricGoalEnvContinuous
+from agents.GaussianIQLagent import IQLAgent
+from utils.tools import set_seed,soft_update,to_tensor
+from utils.minari_replaybuffer import load_minari_dataset,ReplayBuffer
+
+@torch.no_grad()
+def evaluate_policy(
+    agent: IQLAgent,
+    env,
+    replay: ReplayBuffer,
+    episodes: int,
+    seed: int,
+    max_steps:int = 1000
+) -> Dict[str, float]:
+    returns: List[float] = []
+    lengths: List[int] = []
+    for ep in range(episodes):
+        obs, _ = env.reset(seed=seed + ep)
+        done = False
+        ep_ret = 0.0
+        ep_len = 0
+        while not done:
+            action = agent.act(obs, replay=replay, deterministic=True)
+            action = np.clip(action, env.action_space.low, env.action_space.high)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            done = bool(terminated or truncated)
+            ep_ret += float(reward)
+            ep_len += 1
+            if ep_len>max_steps:
+                break
+        returns.append(ep_ret)
+        lengths.append(ep_len)
+    return {
+        "eval_return_mean": float(np.mean(returns)),
+        "eval_return_std": float(np.std(returns)),
+        "eval_length_mean": float(np.mean(lengths)),
+    }
+
+@torch.no_grad()
+def evaluate_policy_video(
+    agent: IQLAgent,
+    env,
+    replay: ReplayBuffer,
+    seed: int,
+    save_dir,
+    max_steps:int = 1000
+) -> Dict[str, float]:
+    returns: List[float] = []
+    lengths: List[int] = []
+    episodes = 1
+    writer = imageio.get_writer(
+    save_dir,
+    fps=int(1 / env.unwrapped.dt),
+    codec="libx264"
+    )
+    for ep in range(episodes):
+        obs, _ = env.reset(seed=seed + ep)
+        done = False
+        ep_ret = 0.0
+        ep_len = 0
+        while not done:
+            frame = env.render()
+            writer.append_data(frame)
+            action = agent.act(obs, replay=replay, deterministic=True)
+            action = np.clip(action, env.action_space.low, env.action_space.high)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            done = bool(terminated or truncated)
+            ep_ret += float(reward)
+            ep_len += 1
+            if ep_len>max_steps:
+                break
+        returns.append(ep_ret)
+        lengths.append(ep_len)
+    writer.close()
+    return {
+        "eval_return_mean": float(np.mean(returns)),
+        "eval_return_std": float(np.std(returns)),
+        "eval_length_mean": float(np.mean(lengths)),
+    }
 
 def train_agent(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     print(f"Loading dataset: {args.dataset_id}")
 
-    bundle = load_minari_dataset(args.dataset_id, device=device,render_mode="rgb_array",horizon=args.act_horizon)
+    bundle = load_minari_dataset(args.dataset_id, device=device,recover=False)
     replay = bundle.replay
-    env = bundle.env
+    env = SymmetricGoalEnvContinuous(render_mode="rgb_array")
 
     print(
         f"Dataset loaded: size={replay.size:,}, obs_dim={bundle.obs_dim}, act_dim={bundle.act_dim}, "
@@ -28,8 +105,8 @@ def train_agent(args):
         f"normalized: obs {replay.obs_mean.mean()}+-{replay.obs_std.mean()} act {replay.act_mean.mean()}+-{replay.act_std.mean()}"
     )
 
-    last_path = args.save_path + "last.pt"
-    best_path = args.save_path + "best.pt"
+    last_path = args.save_path + "iql_symmetric_last.pt"
+    best_path = args.save_path + "iql_symmetric_best.pt"
 
     agent = IQLAgent(
         obs_dim=bundle.obs_dim,
@@ -43,16 +120,10 @@ def train_agent(args):
         critic_lr=args.critic_lr,
         value_lr=args.value_lr,
         grad_clip_norm=args.grad_clip_norm,
-        act_horizon=args.act_horizon,
-        chunk_len=args.act_horizon,
-        unet_dims=[128, 256],
-        cond_dim = 128,
-        time_emb_dim =128,
-        dropout=0.1,
     )
 
     use_wandb = bool(args.use_wandb and wandb is not None)
-    save_videos = bool(args.save_videos)
+    save_videos = bool(args.save_videos and args.env_id is not None)
 
     if args.use_wandb and wandb is None:
         print("wandb is not installed; continuing without wandb logging.")
@@ -81,7 +152,6 @@ def train_agent(args):
     for epoch in pbar:
         batch = replay.sample(args.batch_size)
         metrics = agent.update(batch)
-        metrics = {k: v.item() for k, v in metrics.items()}
         step += args.batch_size
 
         if step >= next_log_step:
@@ -112,13 +182,13 @@ def train_agent(args):
 
         if step >= next_eval_step:
             next_eval_step += args.eval_interval
-            eval_metrics = evaluate_policy(agent, env, replay, episodes=args.eval_episodes, seed=args.seed + 1000,chunk_len=args.chunk_len)
+            eval_metrics = evaluate_policy(agent, env, replay, episodes=args.eval_episodes, seed=args.seed + 1000,max_steps=400)
             print(
                 f"[EVAL] step={step:>7d} "
                 f"return_mean={eval_metrics['eval_return_mean']:.2f} ± {eval_metrics['eval_return_std']:.2f} "
                 f"len_mean={eval_metrics['eval_length_mean']:.1f}"
             )
-            last_path = args.save_path + f"last_{step}.pt"
+            last_path = args.save_path + f"iql_symmetric_last_{step}.pt"
 
             ckpt = {
                 "actor": agent.actor.state_dict(),
@@ -150,12 +220,9 @@ def train_agent(args):
                 torch.save(ckpt, best_path)
                 print(f"Saved best checkpoint to {best_path}")
                 if save_videos:
-                    video_path = "./videos/" + f"rollout_{step}.mp4"
-                    if args.env_id is not None:
-                        video_eval = gym.make(args.env_id,render_mode="rgb_array")
-                    else:
-                        video_eval = env
-                    evaluate_policy_video(agent, video_eval, replay, args.seed + 1000, video_path,chunk_len=args.chunk_len)
+                    video_path = "./videos/" + f"iql_rollout_symmetric_{step}.mp4"
+                    video_eval = SymmetricGoalEnvContinuous(render_mode="rgb_array")
+                    evaluate_policy_video(agent, video_eval, replay, args.seed + 1000, video_path,max_steps=400)
                 if use_wandb:
                     artifact_best = wandb.Artifact(
                         name="best_agent",
@@ -174,3 +241,5 @@ def train_agent(args):
 
     if use_wandb:
         wandb.finish()
+
+    env.close()
