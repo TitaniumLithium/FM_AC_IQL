@@ -26,6 +26,7 @@ def evaluate_policy(
 ) -> Dict[str, float]:
     returns: List[float] = []
     lengths: List[int] = []
+    infos = []
     for ep in range(episodes):
         obs, _ = env.reset(seed=seed + ep)
         done = False
@@ -34,18 +35,20 @@ def evaluate_policy(
         while not done:
             action = agent.act(obs, replay=replay, deterministic=True)
             action = np.clip(action, env.action_space.low, env.action_space.high)
-            obs, reward, terminated, truncated, _ = env.step(action)
+            obs, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
             ep_ret += float(reward)
             ep_len += 1
             if ep_len>max_steps:
                 break
+        infos.append(info)
         returns.append(ep_ret)
         lengths.append(ep_len)
     return {
         "eval_return_mean": float(np.mean(returns)),
         "eval_return_std": float(np.std(returns)),
         "eval_length_mean": float(np.mean(lengths)),
+        "infos": infos
     }
 
 @torch.no_grad()
@@ -183,11 +186,28 @@ def train_agent(args):
         if step >= next_eval_step:
             next_eval_step += args.eval_interval
             eval_metrics = evaluate_policy(agent, env, replay, episodes=args.eval_episodes, seed=args.seed + 1000,max_steps=400)
+            
+            infos = eval_metrics["infos"]
+            success_rate = 0.0
+            for i,info in enumerate(infos):
+                if info["success"]:
+                    success_rate += 1
+            success_rate /= len(infos)
+            
             print(
                 f"[EVAL] step={step:>7d} "
                 f"return_mean={eval_metrics['eval_return_mean']:.2f} ± {eval_metrics['eval_return_std']:.2f} "
                 f"len_mean={eval_metrics['eval_length_mean']:.1f}"
+                f"success_rate={success_rate}"
             )
+            
+            log_metrics = {
+                "eval_return_mean": eval_metrics['eval_return_mean'],
+                "eval_return_std": eval_metrics['eval_return_std'],
+                "eval_length_mean": eval_metrics['eval_length_mean'],
+                "infos": success_rate
+            }
+            
             last_path = args.save_path + f"iql_pusht_last_{step}.pt"
 
             ckpt = {
@@ -206,7 +226,7 @@ def train_agent(args):
             torch.save(ckpt, last_path)
 
             if use_wandb:
-                wandb.log({**eval_metrics, "step": step, "epoch": epoch}, step=epoch)
+                wandb.log({**log_metrics, "step": step, "epoch": epoch}, step=epoch)
                 artifact_last = wandb.Artifact(
                     name=f"last_agent_{step}",
                     type="model"

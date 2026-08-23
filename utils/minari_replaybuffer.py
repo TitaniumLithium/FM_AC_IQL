@@ -116,14 +116,16 @@ def load_minari_dataset(dataset_id: str, device: torch.device, recover = True, *
         obs_list.append(obs[:-1])
         next_obs_list.append(obs[1:])
         act_list.append(actions)
-        rew_list.append(rewards[:, None])
-        done_list.append(dones[:, None].astype(np.float32))
+        rew_list.append(rewards)
+        done_list.append(dones.astype(np.float32))
 
     obs_arr = np.concatenate(obs_list, axis=0)
     act_arr = np.concatenate(act_list, axis=0)
     next_obs_arr = np.concatenate(next_obs_list, axis=0)
     rew_arr = np.concatenate(rew_list, axis=0)
     done_arr = np.concatenate(done_list, axis=0)
+    
+    print(obs_arr.shape,act_arr.shape,next_obs_arr.shape,rew_arr.shape)
 
     obs_mean = torch.as_tensor(obs_arr.mean(axis=0), device=device, dtype=torch.float32)
     obs_std = torch.as_tensor(obs_arr.std(axis=0) + 1e-6, device=device, dtype=torch.float32)
