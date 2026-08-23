@@ -61,6 +61,9 @@ def sinusoidal_embedding(tau: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class ObsConditionEncoder(nn.Module):
+    """
+    Lightweight condition encoder.
+    """
     def __init__(self, obs_dim: int, cond_dim: int, max_groups: int = 8) -> None:
         super().__init__()
         self.net = nn.Sequential(
@@ -88,10 +91,10 @@ def _match_length(x: torch.Tensor, target_len: int) -> torch.Tensor:
     return F.pad(x, (0, target_len - cur_len))
 
 
-
 class FiLMResBlock1D(nn.Module):
     """
-    Residual 1D block with FiLM conditioning from a context vector.
+    Residual 1D block with FiLM conditioning.
+    Conditioning is injected AFTER the first conv, BEFORE the second conv.
     x:    [B, C, L]
     cond: [B, cond_dim]
     """
@@ -108,17 +111,21 @@ class FiLMResBlock1D(nn.Module):
         super().__init__()
         assert kernel_size % 2 == 1, "kernel_size should be odd for 'same' padding."
         padding = kernel_size // 2
+
         self.in_channels = in_channels
         self.out_channels = out_channels
 
         self.norm1 = make_group_norm(in_channels, max_groups=max_groups)
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=padding)
+
         self.norm2 = make_group_norm(out_channels, max_groups=max_groups)
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=kernel_size, padding=padding)
+
         self.cond = nn.Sequential(
             nn.SiLU(),
             nn.Linear(cond_dim, 2 * out_channels),
         )
+
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.skip = (
             nn.Identity()
@@ -127,7 +134,7 @@ class FiLMResBlock1D(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        # x: [B,C,L], cond: [B,cond_dim]
+        # x: [B, C, L], cond: [B, cond_dim]
         h = self.norm1(x)
         h = F.silu(h)
         h = self.conv1(h)
@@ -142,18 +149,77 @@ class FiLMResBlock1D(nn.Module):
         h = self.conv2(h)
 
         return self.skip(x) + h
+    
+
+class ConvNet1D(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        horizon: int,
+        dropout: float = 0.0,
+        cond_dim: int = 64,
+        max_groups: int = 8,
+        kernel_size: int = 4,
+        down_dims: Sequence[int] = (64, 128),
+        ):
+        super().__init__()
+        if len(down_dims) < 1:
+            raise ValueError("down_dims must contain at least one channel size.")
+
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.horizon = horizon
+        self.down_dims = list(down_dims)
+        self.kernel_size = kernel_size
+
+        base_dim = down_dims[0]
+        cond_dim = cond_dim or base_dim
+
+        self.encoders = nn.Sequential()
+
+        curr_channels = self.act_dim
+
+        for i, ch in enumerate(self.down_dims):
+            next_ch = ch
+            self.encoders.append(
+                nn.Conv1d(curr_channels, next_ch, kernel_size=self.kernel_size, stride=2, padding=1),
+            )
+            self.encoders.append(
+                nn.SiLU(),
+            )
+            curr_channels = next_ch
+
+        self.encoders.append(nn.AdaptiveAvgPool1d(1))
+
+        self.final_mlp = nn.Sequential(
+            nn.Linear(curr_channels+self.obs_dim, cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, 1),
+        )
+
+    def forward(self,obs,act_chunk):
+        x = act_chunk.transpose(1, 2)  # [B, act_dim, horizon]
+        x = self.encoders(x)
+        x = x.squeeze(-1)
+        mid = torch.cat([x,obs],dim=-1)
+        out = self.final_mlp(mid)
+        return out.flatten()
+
+
 
 
 class FM1DUnet(nn.Module):
-    """conditional flow-matching using a 1D U-Net backbone.
+    """
+    Lightweight conditional flow-matching 1D U-Net.
 
     Input:
-      - normalized observation sequence [B, T, obs_dim]
-      - noisy action chunk [B, horizon, act_dim]
-      - scalar flow time tau [B, 1]
+      - obs_seq:   [B, obs_h, obs_dim]
+      - noisy_act:  [B, horizon, act_dim]
+      - tau:       [B, 1] or [B]
 
     Output:
-      - predicted velocity field [B, horizon, act_dim]
+      - velocity:   [B, horizon, act_dim]
     """
 
     def __init__(
@@ -161,16 +227,17 @@ class FM1DUnet(nn.Module):
         obs_dim: int,
         act_dim: int,
         horizon: int,
-        dropout: float = 0.1,
-        down_dims: Sequence[int] = (128, 256, 512),
+        dropout: float = 0.0,
+        down_dims: Sequence[int] = (64, 128),
         kernel_size: int = 3,
-        cond_dim: int = 128,
-        time_emb_dim: int = 128,
+        cond_dim: int = 64,
+        time_emb_dim: int = 64,
         max_groups: int = 8,
     ) -> None:
         super().__init__()
         if len(down_dims) < 1:
             raise ValueError("down_dims must contain at least one channel size.")
+
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.horizon = horizon
@@ -182,25 +249,40 @@ class FM1DUnet(nn.Module):
         time_emb_dim = time_emb_dim or base_dim
 
         self.obs_encoder = ObsConditionEncoder(obs_dim=obs_dim, cond_dim=cond_dim)
+
         self.tau_mlp = nn.Sequential(
             nn.Linear(time_emb_dim, cond_dim),
             nn.SiLU(),
             nn.Linear(cond_dim, cond_dim),
         )
-        self.cond_fuse = nn.Linear(cond_dim, cond_dim)
+
+        self.score_mlp = nn.Sequential(
+            nn.Linear(1, cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
+
+        self.null_emb = nn.Parameter(torch.zeros((cond_dim,), dtype=torch.float32), requires_grad=True)
+        nn.init.normal_(self.null_emb,std=0.01)
+        
+        self.cond_fuse = nn.Sequential(
+            nn.Linear(3 * cond_dim, 2 * cond_dim),
+            nn.SiLU(),
+            nn.Linear(2 * cond_dim, cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
 
         in_padding = kernel_size // 2
         self.act_in = nn.Sequential(
             nn.Conv1d(act_dim, base_dim, kernel_size=kernel_size, padding=in_padding),
             make_group_norm(base_dim, max_groups=max_groups),
             nn.SiLU(),
-            nn.Conv1d(base_dim, base_dim, kernel_size=kernel_size, padding=in_padding),
         )
 
         # Encoder
         self.enc_blocks = nn.ModuleList()
         self.downsamples = nn.ModuleList()
-
 
         curr_channels = base_dim
         for i, ch in enumerate(self.down_dims):
@@ -215,17 +297,14 @@ class FM1DUnet(nn.Module):
                 )
             )
             curr_channels = ch
-
             if i < len(self.down_dims) - 1:
                 next_ch = self.down_dims[i + 1]
-                # Standard strided conv downsample
                 self.downsamples.append(
                     nn.Conv1d(curr_channels, next_ch, kernel_size=4, stride=2, padding=1)
                 )
                 curr_channels = next_ch
 
-
-        # Bottleneck
+        # Bottleneck: one block
         self.mid_blocks = nn.ModuleList(
             [
                 FiLMResBlock1D(
@@ -235,25 +314,14 @@ class FM1DUnet(nn.Module):
                     kernel_size=kernel_size,
                     dropout=dropout,
                     max_groups=max_groups,
-                ),
-                FiLMResBlock1D(
-                    in_channels=self.down_dims[-1],
-                    out_channels=self.down_dims[-1],
-                    cond_dim=cond_dim,
-                    kernel_size=kernel_size,
-                    dropout=dropout,
-                    max_groups=max_groups,
-                ),
+                )
             ]
         )
 
-
-        # Decoder
+        # Decoder: transpose conv upsample + concat skip
         self.upsamples = nn.ModuleList()
         self.dec_blocks = nn.ModuleList()
 
-
-        # Symmetric with encoder: reverse all but the deepest level
         for i in range(len(self.down_dims) - 1, 0, -1):
             deep_ch = self.down_dims[i]
             skip_ch = self.down_dims[i - 1]
@@ -278,29 +346,28 @@ class FM1DUnet(nn.Module):
             nn.Conv1d(self.down_dims[0], act_dim, kernel_size=1),
         )
 
-    def _build_condition(self, obs_seq: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
-        """
-        obs_seq: [B, T, obs_dim]
-        tau:     [B, 1] or [B]
-        """
-        cond = self.obs_encoder(obs_seq)  # [B, cond_dim]
+    def _build_condition(self, obs_seq: torch.Tensor, tau: torch.Tensor, tune: torch.Tensor = None, mask: torch.Tensor = None) -> torch.Tensor:
+        obs_cond = self.obs_encoder(obs_seq)  # [B, cond_dim]
 
         if tau.dim() == 1:
             tau = tau.unsqueeze(-1)
         tau_emb = sinusoidal_embedding(tau, self.tau_mlp[0].in_features)
         tau_cond = self.tau_mlp(tau_emb)
 
-        cond = self.cond_fuse(cond + tau_cond)
+        score_cond = self.score_mlp(tune) if tune is not None else torch.zeros_like(obs_cond)
+
+        if mask is not None:
+            score_cond = torch.where(mask, score_cond, self.null_emb)
+            # mask = True for valid tune, False for invalid tune
+
+        cond = self.cond_fuse(torch.cat([obs_cond,tau_cond,score_cond],dim=-1))
         return cond
 
-    def forward(self, obs_seq: torch.Tensor, noisy_act: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
-        # obs_seq: [B, T, obs_dim]
-        # noisy_act: [B, horizon, act_dim]
-        # tau: [B, 1]
-        cond = self._build_condition(obs_seq, tau)
+    def forward(self, obs_seq: torch.Tensor, noisy_act: torch.Tensor, tau: torch.Tensor, tune: torch.Tensor = None, mask: torch.Tensor = None) -> torch.Tensor:
+        cond = self._build_condition(obs_seq, tau, tune, mask)
 
-        x = noisy_act.transpose(1, 2)  # [B, horizon, act_dim] -> [B, act_dim, horizon]
-        x = self.act_in(x)             # [B, act_dim, horizon]
+        x = noisy_act.transpose(1, 2)  # [B, act_dim, horizon]
+        x = self.act_in(x)
 
         skips: List[torch.Tensor] = []
 
@@ -322,7 +389,7 @@ class FM1DUnet(nn.Module):
             x = torch.cat([x, skip], dim=1)         # [B, 2*skip_ch, L]
             x = block(x, cond)                      # [B, skip_ch, L]
 
-        velocity = self.out(x).transpose(1, 2)  # [B, horizon, act_dim]
+        velocity = self.out(x).transpose(1, 2)      # [B, horizon, act_dim]
         return velocity
 
 
@@ -416,3 +483,59 @@ class FMTFnet(nn.Module):
         act_hidden = x[:, 1:, :]
         velocity = self.final(act_hidden)
         return velocity
+
+
+class ConvNet1D(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        horizon: int,
+        dropout: float = 0.0,
+        cond_dim: int = 64,
+        max_groups: int = 8,
+        kernel_size: int = 4,
+        down_dims: Sequence[int] = (64, 128),
+        ):
+        super().__init__()
+        if len(down_dims) < 1:
+            raise ValueError("down_dims must contain at least one channel size.")
+
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.horizon = horizon
+        self.down_dims = list(down_dims)
+        self.kernel_size = kernel_size
+
+        base_dim = down_dims[0]
+        cond_dim = cond_dim or base_dim
+
+        self.encoders = nn.Sequential()
+
+        curr_channels = self.act_dim
+
+        for i, ch in enumerate(self.down_dims):
+            next_ch = ch
+            self.encoders.append(
+                nn.Conv1d(curr_channels, next_ch, kernel_size=self.kernel_size, stride=2, padding=1),
+            )
+            self.encoders.append(
+                nn.SiLU(),
+            )
+            curr_channels = next_ch
+
+        self.encoders.append(nn.AdaptiveAvgPool1d(1))
+
+        self.final_mlp = nn.Sequential(
+            nn.Linear(curr_channels+self.obs_dim, cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, 1),
+        )
+
+    def forward(self,obs,act_chunk):
+        x = act_chunk.transpose(1, 2)  # [B, act_dim, horizon]
+        x = self.encoders(x)
+        x = x.squeeze(-1)
+        mid = torch.cat([x,obs],dim=-1)
+        out = self.final_mlp(mid)
+        return out.flatten()

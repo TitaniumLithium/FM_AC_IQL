@@ -26,6 +26,9 @@ def main():
     parser.add_argument("--chunk_len", type=int, default=4)
     parser.add_argument("--save_videos", type=int, default=0)
     parser.add_argument("--env_id", type=str, default="pusht")
+    parser.add_argument("--cfg_drop", type=float, default=0.1)
+    parser.add_argument("--cfg_tune", type=float, default=1.0)
+    parser.add_argument("--cfg_weight", type=float, default=1.5)
     args = parser.parse_args()
     train_agent(args)
 

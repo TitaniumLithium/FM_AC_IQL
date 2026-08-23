@@ -50,6 +50,9 @@ def train_agent(args):
         cond_dim = 128,
         time_emb_dim =128,
         dropout=0.1,
+        cfg_drop = args.cfg_drop,
+        cfg_tune = args.cfg_tune,
+        cfg_weight = args.cfg_weight
     )
 
     use_wandb = bool(args.use_wandb and wandb is not None)
