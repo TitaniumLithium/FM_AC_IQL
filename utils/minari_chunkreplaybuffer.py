@@ -157,7 +157,8 @@ def load_minari_dataset(
             act_list.append(actions[t:end])             # [horizon, act_dim]
             next_obs_list.append(obs[t+1:end+1])              # state after chunk
             rew_list.append(rewards[t:end])             # [horizon]
-            done_list.append(dones[t:end])
+            # terminal
+            done_list.append(terminations[t:end])
 
 
     if len(obs_list) == 0:
