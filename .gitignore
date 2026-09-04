@@ -14,6 +14,15 @@ wandb/
 *.pt
 *.mp4
 
+minari/runs/
+minari/checkpoints/
+minari/logs/
+minari/videos/
+minari/dataset/
+minari/wandb/
+
+D4RL_CORL/wandb/
+
 # C extensions
 *.so
 

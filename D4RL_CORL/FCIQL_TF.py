@@ -92,6 +92,7 @@ class TrainConfig:
     cfg_tune: float = 1.0
     cfg_weight: float = 1.5
     cfg_drop: float = 0.1
+    fm_steps: int = 10
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -271,6 +272,7 @@ class ReplayBuffer:
                 act_list.append(actions[t:end])             # [horizon, act_dim]
                 next_obs_list.append(next_obs[t:end])              # state after chunk
                 rew_list.append(rewards[t:end])             # [horizon]
+                # test for dones
                 done_list.append(terminations[t:end])
 
         obs_arr = np.stack(obs_list, axis=0)                    # [N, horizon, obs_dim]
@@ -297,6 +299,95 @@ class ReplayBuffer:
 
         print(f"Dataset size: {n}")
 
+    def load_minari_dataset(self, dataset):
+        obs_list: List[np.ndarray] = []
+        act_list: List[np.ndarray] = []
+        next_obs_list: List[np.ndarray] = []
+        rew_list: List[np.ndarray] = []
+        done_list: List[np.ndarray] = [] 
+        terminal_list: List[np.ndarray] = []
+        all_act_list= []
+        all_obs_list = []
+
+        horizon = self.action_horizon
+
+        for ep in dataset.iterate_episodes():
+            obs = np.asarray(ep.observations, dtype=np.float32)
+            actions = np.asarray(ep.actions, dtype=np.float32)
+            rewards = np.asarray(ep.rewards, dtype=np.float32)
+            terminations = np.asarray(ep.terminations, dtype=np.bool_)
+            truncations = np.asarray(ep.truncations, dtype=np.bool_)
+            dones = np.logical_or(terminations, truncations)
+
+            #flatten rewards,ter,done to 1D
+            rewards = rewards.flatten()
+            terminations = terminations.flatten()
+            dones = dones.flatten()
+
+            all_act_list.append(actions)
+            all_obs_list.append(obs)
+
+            T = actions.shape[0]
+            if T < horizon:
+                continue
+
+            for t in range(T - horizon + 1):
+                end = t + horizon
+
+                # Optional safety check:
+                # do not let the chunk cross an earlier terminal/truncation.
+                # In standard episode data this usually will not happen except at the end.
+                if np.any(dones[t:end - 1]):
+                    continue
+
+                obs_list.append(obs[t:end])                     # starting state
+                act_list.append(actions[t:end])             # [horizon, act_dim]
+                next_obs_list.append(obs[t+1:end+1])              # state after chunk
+                rew_list.append(rewards[t:end])             # [horizon]
+                done_list.append(dones[t:end])
+                terminal_list.append(terminations[t:end])
+
+        if len(obs_list) == 0:
+            raise ValueError(
+                f"No valid chunk samples found."
+            )
+
+        obs_arr = np.stack(obs_list, axis=0)
+        act_arr = np.stack(act_list, axis=0)
+        next_obs_arr = np.stack(next_obs_list, axis=0)
+        rew_arr = np.stack(rew_list, axis=0)
+        done_arr = np.stack(done_list, axis=0)
+        terminal_arr = np.stack(terminal_list, axis=0)
+
+        all_act_arr = np.concatenate(all_act_list, axis=0) # [N, act_dim]
+        all_obs_arr = np.concatenate(all_obs_list, axis=0) # [N, obs_dim]
+
+        assert obs_arr.shape[0] ==  act_arr.shape[0] == next_obs_arr.shape[0] == rew_arr.shape[0] == terminal_arr.shape[0]
+
+        print(obs_arr.shape,act_arr.shape,done_arr.shape)
+
+        obs_mean,obs_std = compute_mean_std(all_obs_arr,eps=1e-5)
+        act_mean,act_std = compute_mean_std(all_act_arr,eps=1e-5)
+
+        n_obs = (obs_arr - obs_mean) / obs_std
+        n_obs_next = (next_obs_arr - obs_mean) / obs_std
+        n_act = (act_arr - act_mean) / act_std
+
+        n = min(obs_arr.shape[0], self._buffer_size)
+
+        self._states_chunk[:n] = self._to_tensor(n_obs) #[N, chunk_len, obs_dim]
+        self._actions_chunk[:n] = self._to_tensor(n_act)  # [N, chunk_len, act_dim]
+        self._rewards_chunk[:n] = self._to_tensor(rew_arr)
+        self._next_states_chunk[:n] = self._to_tensor(n_obs_next)
+        self._terminal_chunk[:n] = self._to_tensor(terminal_arr)
+        self._size = n
+        self._pointer = n
+
+        print(f"Dataset size: {n}")
+
+        return obs_mean,obs_std,act_mean,act_std
+
+        
     def sample(self, batch_size: int) -> TensorBatch:
         indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
         states_chunk = self._states_chunk[indices]
@@ -338,7 +429,7 @@ def wandb_init(config: dict) -> None:
 
 @torch.no_grad()
 def eval_actor(
-    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int, chunk_len=4,save_video=False,max_timesteps=400,new_gym=False,normalize_info = None
+    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int, chunk_len=4,save_video=False,max_timesteps=400,new_gym=False,normalize_info = None,num_steps = 10
 ) -> np.ndarray:
     #env.seed(seed)
     actor.net.eval()
@@ -359,8 +450,9 @@ def eval_actor(
 
         episode_reward = 0.0
         step = 0
+        max_coverage = 0.0
         while not done:
-            action_chunk = actor.act(state, device)
+            action_chunk = actor.act(state, device,num_steps=num_steps)
             if normalize_info:
                 mean, std = normalize_info["act_mean"], normalize_info["act_std"]
                 action_chunk = unnormalize(action_chunk,mean,std)
@@ -371,7 +463,9 @@ def eval_actor(
                 if new_gym:
                     state, reward, terminal, trunc, info = env.step(action)
                     done = terminal or trunc
-                    if i==0 and save_video:
+                    converage = info.get("coverage",0)
+                    max_coverage = max(max_coverage,converage)
+                    if i==n_episodes - 1 and save_video:
                         frame = env.render()
                         writer.append_data(frame)
                 else:
@@ -383,6 +477,7 @@ def eval_actor(
             if step>=max_timesteps:
                 break
 
+        info["max_coverage"] = max_coverage
         episode_rewards.append(episode_reward)
         infos.append(info)
     
@@ -864,7 +959,114 @@ class FM1DUnet(nn.Module):
 
 #---
 
+class FMTFnet(nn.Module):
+    """conditional flow-matching using a TF backbone.
 
+    Input:
+      - normalized observation sequence [B, T, obs_dim]
+      - noisy action chunk [B, horizon, act_dim]
+      - scalar flow time tau [B, 1]
+
+    Output:
+      - predicted velocity field [B, horizon, act_dim]
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        horizon: int,
+        dropout: float = 0.1,
+        cond_dim: int = 128,
+        time_emb_dim: int = 128,
+        max_groups: int = 8,
+    ) -> None:
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.horizon = horizon
+        self.time_emb_dim = time_emb_dim
+
+        self.obs_encoder = nn.Sequential(
+            nn.Linear(obs_dim, cond_dim),
+            nn.LayerNorm(cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
+        self.act_encoder = nn.Sequential(
+            nn.Linear(act_dim, cond_dim),
+            nn.LayerNorm(cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
+        self.tau_mlp = nn.Sequential(
+            nn.Linear(time_emb_dim, cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
+        self.score_mlp = nn.Sequential(
+            nn.Linear(1, cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
+
+        self.null_emb = nn.Parameter(torch.zeros((1,cond_dim), dtype=torch.float32), requires_grad=True)
+        nn.init.normal_(self.null_emb,std=0.01)
+
+        self.obs_pos = nn.Parameter(torch.randn(1, 1, cond_dim) * 0.02)
+        self.act_pos = nn.Parameter(torch.randn(1, horizon, cond_dim) * 0.02)
+        self.score_pos = nn.Parameter(torch.randn(1, 1, cond_dim) * 0.02)
+        #self.ctx_summary = nn.Parameter(torch.randn(1, 1, cond_dim) * 0.02) not use
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=cond_dim,
+            nhead=8,
+            dim_feedforward=1024,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
+        )
+        self.blocks = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        self.final = nn.Sequential(
+            nn.LayerNorm(cond_dim),
+            nn.Linear(cond_dim, cond_dim),
+            nn.GELU(),
+            nn.Linear(cond_dim, act_dim),
+        )
+
+    def forward(self, obs: torch.Tensor, noisy_act: torch.Tensor, tau: torch.Tensor, tune: torch.Tensor = None, mask: torch.Tensor = None) -> torch.Tensor:
+        # obs: [B, obs_dim]
+        # noisy_act: [B, horizon, act_dim]
+        # tau: [B, 1]
+        # tune [B, 1]
+        # mask [B, 1]
+        B = obs.shape[0]
+
+        obs_tokens = self.obs_encoder(obs) # [B,1,C]
+        obs_tokens = obs_tokens + self.obs_pos
+
+        tau_emb = sinusoidal_embedding(tau, self.time_emb_dim)
+        tau_emb = self.tau_mlp(tau_emb).unsqueeze(1)  # [B,1,C]
+
+        act_tokens = self.act_encoder(noisy_act) + self.act_pos[:, :noisy_act.size(1)] + tau_emb
+
+        score_tokens = self.score_mlp(tune).unsqueeze(1) if tune is not None else torch.zeros_like(tau_emb)
+        # [B,1,C]
+
+        if mask is not None:
+            mask = mask.unsqueeze(-1)
+            score_tokens = torch.where(mask, score_tokens, self.null_emb)
+            # mask = True for valid tune, False for invalid tune
+
+        score_tokens = score_tokens + self.score_pos
+
+        
+        x = torch.cat([obs_tokens, score_tokens, act_tokens], dim=1)
+        x = self.blocks(x)
+        action_tokens = x[:, 2:]
+        velocity = self.final(action_tokens)
+        return velocity
 
 class GaussianPolicy(nn.Module):
     def __init__(
@@ -934,23 +1136,19 @@ class DeterministicPolicy(nn.Module):
 class FMPolicy(nn.Module):
     def __init__(self, obs_dim: int, act_dim: int, device: torch.device, act_horizon=4, chunk_len=4, unet_dims=[128, 256, 512], cond_dim = 128, time_emb_dim = 128, dropout=0,cfg_tune=1.0,cfg_weight=1.5):
         super().__init__()
-        self.act_horizon = max(4,act_horizon)
-        self.net = FM1DUnet(
+        self.act_horizon = act_horizon
+        self.net = FMTFnet(
             obs_dim=obs_dim,
             act_dim=act_dim,
             horizon=self.act_horizon,
-            down_dims=unet_dims,
-            kernel_size=3,
             cond_dim=cond_dim,
             time_emb_dim=time_emb_dim,
             dropout=dropout,
         ).to(device)
-        self.shadow_model = FM1DUnet(
+        self.shadow_model = FMTFnet(
             obs_dim=obs_dim,
             act_dim=act_dim,
             horizon=self.act_horizon,
-            down_dims=unet_dims,
-            kernel_size=3,
             cond_dim=cond_dim,
             time_emb_dim=time_emb_dim,
             dropout=dropout,
@@ -994,6 +1192,10 @@ class FMPolicy(nn.Module):
         x_tau = tau_b * target_act + (1.0 - tau_b) * eps
         target_velocity = target_act - eps
 
+        # test Q_grad
+        # target_velocity
+        #Q_grad = Q(s,x_tau)
+
         pred_velocity = model(obs_seq, x_tau, tau,tune=tune,mask=mask)
 
         err = (pred_velocity - target_velocity)**2
@@ -1034,14 +1236,14 @@ class FMPolicy(nn.Module):
         return x
 
     @torch.no_grad()
-    def act(self, state: np.ndarray, device: str = "cpu",ema = True, tune = None, cfg_weight=None):
+    def act(self, state: np.ndarray, device: str = "cpu",ema = True, tune = None, cfg_weight=None,num_steps=None):
         state = torch.tensor(state.reshape(1, -1), device=device, dtype=torch.float32)
         net = self.shadow_model if ema else self.net
         if tune is None:
             tune = self.cfg_tune
         if cfg_weight is None:
             cfg_weight = self.cfg_weight
-        action_chunk = self.sample_action_chunk_cfg(state,net=net,cfg_tune=tune, cfg_weight=cfg_weight)
+        action_chunk = self.sample_action_chunk_cfg(state,net=net,cfg_tune=tune, cfg_weight=cfg_weight, num_steps=num_steps)
         return action_chunk.squeeze(0).cpu().numpy()
 
 
@@ -1051,20 +1253,25 @@ class TwinQ(nn.Module):
     ):
         super().__init__()
         dims = [state_dim + action_dim * chunk_len, *([hidden_dim] * n_hidden), 1]
-        self.q1 = ConvNet1D(state_dim,action_dim,chunk_len,cond_dim=hidden_dim)
-        self.q2 = ConvNet1D(state_dim,action_dim,chunk_len,cond_dim=hidden_dim)
+        self.q1 = MLP(dims, squeeze_output=True)
+        self.q2 = MLP(dims, squeeze_output=True)
         self.chunk_dim = action_dim * chunk_len
 
     def both(
         self, state: torch.Tensor, action_chunk: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.q1(state,action_chunk), self.q2(state,action_chunk)
+        B = state.shape[0]
+        action_chunk = action_chunk.reshape(B,-1)
+        sa = torch.cat([state, action_chunk], 1)
+        return self.q1(sa), self.q2(sa)
 
     def forward(self, state: torch.Tensor, action_chunk: torch.Tensor) -> torch.Tensor:
         '''
         obs [B, obs_dim]
         action_chunk [B, H, act_dim]
         '''
+        B = state.shape[0]
+        action_chunk = action_chunk.reshape(B,-1)
         return torch.min(*self.both(state, action_chunk))
 
 
@@ -1153,8 +1360,8 @@ class ImplicitQLearning:
         terminals: torch.Tensor,
         log_dict: Dict,
     ):
-        chunk_gamma = self.discount ** self.chunk_len
-        chunk_discounts = self.discount ** torch.arange(self.chunk_len,device=self.device)
+        chunk_gamma = self.discount ** self.act_horizon
+        chunk_discounts = self.discount ** torch.arange(self.act_horizon,device=self.device)
         chunk_rewards = (rewards * chunk_discounts[None,:]).sum(dim=1) # [B]
         chunk_rewards = chunk_rewards/self.act_horizon
         chunk_terminals = terminals.any(dim=1)
@@ -1200,12 +1407,9 @@ class ImplicitQLearning:
         mask = (torch.rand(B,1,device=self.actor.device) > p_drop) # [B,1]
         # p_drop = 0.1, so 10% of the weights are masked out (set to zero) during training.
 
-        weights = torch.where(mask,torch.ones_like(exp_adv).reshape(-1,1),exp_adv.reshape(-1,1))
-
         fm_loss = self.actor.flow_match_loss_cfg(observations, actions, tune=tune, mask=mask)
         fm_loss = fm_loss.reshape(-1,1)
 
-        #policy_loss = torch.mean(weights * fm_loss)
         policy_loss = torch.mean(fm_loss)
         log_dict["actor_loss"] = policy_loss.item()
 
@@ -1248,8 +1452,8 @@ class ImplicitQLearning:
             next_v = self.vf(final_obs)
         # Update value function
         adv = self._update_v(init_obs, actions, log_dict)
-        rewards = rewards.squeeze(dim=-1)
-        dones = dones.squeeze(dim=-1)
+        #rewards = rewards.squeeze(dim=-1)
+        #dones = dones.squeeze(dim=-1)
         # Update Q function
         self._update_q(next_v, init_obs, actions, rewards, dones, log_dict)
         # Update actor
@@ -1296,9 +1500,9 @@ def train(config: TrainConfig):
     if "pusht" in config.env:
         import sys
         sys.path.append("./")
-        from algorithms.offline.minari_loader import load_minari_dataset
+        from algorithms.offline.minari_loader import load_minari_dataset,load_env_minari
         import gymnasium as gym
-        dataset,env = load_minari_dataset(config.env,config.device)
+        env,dataset = load_env_minari(config.env)
         state_dim = env.observation_space.shape[0]
         action_dim = env.action_space.shape[0]
     else:
@@ -1322,30 +1526,35 @@ def train(config: TrainConfig):
             assert len(dataset["next_observations"]) == len(dataset["observations"]) == len(dataset["actions"]) == len(dataset["timeouts"]) == len(dataset["terminals"]) == len(dataset["rewards"])
     
 
-    if config.normalize_reward:
-        modify_reward(dataset, config.env)
+        if config.normalize_reward:
+            modify_reward(dataset, config.env)
 
-    if config.normalize:
-        state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
-    else:
-        state_mean, state_std = 0, 1
+        if config.normalize:
+            state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
+        else:
+            state_mean, state_std = 0, 1
 
-    dataset["observations"] = normalize_states(
-        dataset["observations"], state_mean, state_std
-    )
-    dataset["next_observations"] = normalize_states(
-        dataset["next_observations"], state_mean, state_std
+        dataset["observations"] = normalize_states(
+            dataset["observations"], state_mean, state_std
+        )
+        dataset["next_observations"] = normalize_states(
+            dataset["next_observations"], state_mean, state_std
+        )
+
+    replay_buffer = ReplayBuffer(
+        state_dim,
+        action_dim,
+        config.buffer_size,
+        config.device,
+        chunk_len=config.horizon
     )
 
     act_normalize_info = {}
 
     if "pusht" in config.env:
+        state_mean,state_std,act_mean,act_std = replay_buffer.load_minari_dataset(dataset)
         obs_space = env.observation_space
         env = wrap_env_gymnasium(env, gym, obs_space, state_mean=state_mean, state_std=state_std)
-        act_mean, act_std = compute_mean_std(dataset["actions"], eps=1e-5)
-        dataset["actions"] = normalize_states(
-            dataset["actions"], act_mean, act_std
-        )
         act_normalize_info["act_mean"] = act_mean
         act_normalize_info["act_std"] = act_std
 
@@ -1359,14 +1568,7 @@ def train(config: TrainConfig):
         act_normalize_info["act_mean"] = act_mean
         act_normalize_info["act_std"] = act_std
 
-    replay_buffer = ReplayBuffer(
-        state_dim,
-        action_dim,
-        config.buffer_size,
-        config.device,
-        chunk_len=config.horizon
-    )
-    replay_buffer.load_d4rl_dataset(dataset,gamma=config.discount)
+        replay_buffer.load_d4rl_dataset(dataset,gamma=config.discount)
 
     max_action = float(env.action_space.high[0])
 
@@ -1386,7 +1588,7 @@ def train(config: TrainConfig):
     else:
         set_seed(seed, env)
 
-    q_network = TwinQ(state_dim, action_dim).to(config.device)
+    q_network = TwinQ(state_dim, action_dim,chunk_len=config.horizon).to(config.device)
     v_network = ValueFunction(state_dim).to(config.device)
     actor = FMPolicy(
         state_dim, 
@@ -1481,7 +1683,8 @@ def train(config: TrainConfig):
                 max_timesteps=400 if "pusht" in config.env else 1000,
                 new_gym=True if "pusht" in config.env else False,
                 save_video=True if "pusht" in config.env else False,
-                normalize_info=act_normalize_info if len(act_normalize_info)>0 else None
+                normalize_info=act_normalize_info if len(act_normalize_info)>0 else None,
+                num_steps = config.fm_steps
             )
             eval_score = eval_scores.mean()
             score_std = eval_scores.std()
@@ -1490,7 +1693,7 @@ def train(config: TrainConfig):
             else:
                 normalized_eval_score = torch.zeros((config.n_episodes,))
                 for i,info in enumerate(infos):
-                    print(info["success"])
+                    print(info["success"],info.get("max_coverage",0))
                     if info["success"]:
                         normalized_eval_score[i] += 1
                 if config.use_wandb:
