@@ -1500,7 +1500,7 @@ def train(config: TrainConfig):
     if "pusht" in config.env:
         import sys
         sys.path.append("./")
-        from algorithms.offline.minari_loader import load_minari_dataset,load_env_minari
+        from minari_loader import load_minari_dataset,load_env_minari
         import gymnasium as gym
         env,dataset = load_env_minari(config.env)
         state_dim = env.observation_space.shape[0]
